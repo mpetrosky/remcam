@@ -1,0 +1,15 @@
+[package]
+name = "remcam-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+libc = "0.2.190"
+quinn = "0.11.12"
+remcam-proto = { version = "0.1.0", path = "../remcam-proto" }
+tokio = { version = "1.53.2", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+v4l = "0.14.0"
