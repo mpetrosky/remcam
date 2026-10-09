@@ -124,8 +124,12 @@ used for latency measurement and, later, A/V sync if a mic is forwarded.
    it to break on packet loss; that's what the real protocol fixes.
 1. **M1 (done):** server captures MJPEG with `v4l` and sends frames over quinn. Client
    writes `.jpg` files and logs latency and frame rate.
-2. **M2:** client decodes and writes to v4l2loopback. End-to-end camera in
-   OBS or a browser.
+2. **M2 (done):** client decodes and writes to v4l2loopback. End-to-end camera in
+   OBS or a browser. Decoding uses libjpeg-turbo straight to planar YUV, then
+   interleaves to YUYV with a full-to-limited range LUT. `zune-jpeg` (RGB only,
+   so JPEG→RGB→YUYV) is the fallback without the `turbojpeg` feature, and for
+   chroma layouts other than 4:2:2/4:2:0. Note that the `turbojpeg` crate 1.x
+   requires libjpeg-turbo ≥ 3.0, but Debian trixie ships 2.1.5, so we pin 0.5.x.
 3. **M3:** device and format negotiation, camera control forwarding, mDNS
    discovery, reconnection, and stale-frame dropping.
 4. **M4:** H.264 encode, keyframe requests, and adaptive bitrate from QUIC
@@ -143,6 +147,38 @@ used for latency measurement and, later, A/V sync if a mic is forwarded.
   passthrough, costlier with per-client encoders).
 - **Audio:** many webcams include a mic. It could be forwarded on the same
   connection as Opus, or left to PipeWire's existing RTP module.
-- **Windows/macOS receivers:** virtual camera drivers are platform-specific
-  (DirectShow/Media Foundation, CoreMediaIO). The protocol is portable; the
-  sink isn't.
+- **Windows/macOS receivers:** the protocol is portable, but the sink isn't.
+  See section 7.
+
+## 7. Platform notes (not a current goal)
+
+### Virtual camera sink
+
+| OS | Replacement for v4l2loopback | Notes |
+|---|---|---|
+| Linux | v4l2loopback (now), PipeWire node (later) | |
+| Windows 11 | Media Foundation virtual camera (`MFCreateVirtualCamera`) | Needs a COM media source; Windows 10 needs a DirectShow filter instead |
+| macOS 12.3+ | CoreMediaIO Camera Extension | Ships inside a signed app bundle, and the user must approve it |
+
+All of these expect NV12 or YUY2 frames, so "decode MJPEG to YUV" carries over
+unchanged. Only the hand-off to the OS differs.
+
+### JPEG decoding
+
+| OS | libjpeg-turbo (portable, SIMD) | Native / hardware alternative |
+|---|---|---|
+| Linux | `libturbojpeg0-dev` (apt) | VAAPI JPEG decode (Intel/AMD GPUs) |
+| macOS | `brew install jpeg-turbo` | VideoToolbox (hardware JPEG, outputs YUV directly) |
+| Windows | vcpkg `libjpeg-turbo`, or the official installer | Media Foundation MJPEG decoder MFT; D3D11 hardware JPEG decode on Intel GPUs |
+
+- The `turbojpeg` crate either builds its bundled libjpeg-turbo (cmake, plus
+  `nasm` on x86 only; ARM uses NEON and needs neither) or links a system copy
+  (`pkg-config` feature, or `TURBOJPEG_LIB_DIR` / `TURBOJPEG_INCLUDE_DIR`). The
+  bundled build links statically, so it's a build-time dependency, not a
+  runtime one.
+- `nasm` is available via `brew install nasm` on macOS and
+  `winget install NASM.NASM` on Windows.
+- `zune-jpeg` (pure Rust) builds everywhere with no setup and remains the
+  fallback.
+- The native decoders avoid the CPU cost entirely, but each needs its own
+  platform-specific code path.

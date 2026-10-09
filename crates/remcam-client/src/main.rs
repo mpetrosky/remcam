@@ -1,7 +1,11 @@
 //! remcam-client: receives a camera stream from remcam-server.
 //!
-//! M1: frames are optionally saved as JPEG files, and throughput and latency
-//! are logged once per second. Later milestones feed a v4l2loopback device.
+//! Frames can be fed to a v4l2loopback device (`--sink`), so local apps see
+//! the remote camera as a normal webcam, and/or saved as JPEG files (`--out`).
+//! Throughput and latency are logged once per second.
+
+mod decode;
+mod sink;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -43,6 +47,10 @@ struct Args {
     /// Skip server authentication. The connection is still encrypted.
     #[arg(long, conflicts_with = "fingerprint")]
     insecure: bool,
+
+    /// Feed frames to this v4l2loopback device (e.g. /dev/video10).
+    #[arg(long, value_name = "DEVICE")]
+    sink: Option<String>,
 
     /// Save each received frame as DIR/<seq>.jpg.
     #[arg(long, value_name = "DIR")]
@@ -142,10 +150,10 @@ async fn run(conn: &quinn::Connection, args: &Args) -> anyhow::Result<()> {
         },
     )
     .await?;
-    let epoch = match read_msg(&mut ctl_rx).await? {
+    let (epoch, actual) = match read_msg(&mut ctl_rx).await? {
         ServerMsg::Opened { epoch, format } => {
             info!("streaming {} ({}) as {format}", device.id, device.name);
-            epoch
+            (epoch, format)
         }
         ServerMsg::Error { msg } => bail!("server could not open {}: {msg}", device.id),
         other => bail!("expected Opened, got {other:?}"),
@@ -161,6 +169,15 @@ async fn run(conn: &quinn::Connection, args: &Args) -> anyhow::Result<()> {
     if let Some(dir) = &args.out {
         tokio::fs::create_dir_all(dir).await?;
     }
+    let sink = args
+        .sink
+        .as_deref()
+        .map(|path| sink::Sink::start(path, actual))
+        .transpose()?;
+    let sink_dropped = || {
+        sink.as_ref()
+            .map_or(0, |s| s.dropped.swap(0, Ordering::Relaxed))
+    };
 
     let (frame_tx, mut frame_rx) = mpsc::channel(8);
     let stale = Arc::new(AtomicU64::new(0));
@@ -178,16 +195,19 @@ async fn run(conn: &quinn::Connection, args: &Args) -> anyhow::Result<()> {
                 if let Some(dir) = &args.out {
                     tokio::fs::write(dir.join(format!("{:08}.jpg", header.seq)), &data).await?;
                 }
+                if let Some(sink) = &sink {
+                    sink.push(data)?;
+                }
                 received += 1;
                 if args.frames.is_some_and(|n| received >= n) {
                     break;
                 }
             }
-            _ = tick.tick() => stats.report(conn, stale.swap(0, Ordering::Relaxed)),
+            _ = tick.tick() => stats.report(conn, stale.swap(0, Ordering::Relaxed), sink_dropped()),
             _ = tokio::signal::ctrl_c() => break,
         }
     }
-    stats.report(conn, stale.swap(0, Ordering::Relaxed));
+    stats.report(conn, stale.swap(0, Ordering::Relaxed), sink_dropped());
     write_msg(&mut ctl_tx, &ClientMsg::Close).await?;
     ctl_tx.finish()?;
     Ok(())
@@ -276,14 +296,14 @@ impl Stats {
     /// Log and reset the per-interval counters. Latency compares the server's
     /// and the client's wall clocks, so it is only meaningful when both are
     /// NTP-synced (or the same machine).
-    fn report(&mut self, conn: &quinn::Connection, stale: u64) {
+    fn report(&mut self, conn: &quinn::Connection, stale: u64, sink_dropped: u64) {
         let avg_ms = if self.frames > 0 {
             self.latency_sum_us as f64 / self.frames as f64 / 1000.0
         } else {
             0.0
         };
         info!(
-            "{:>3} fps  {:>6.1} Mbit/s  latency avg {:>6.1} ms max {:>6.1} ms  rtt {:>5.1} ms  missing {} (stale {})",
+            "{:>3} fps  {:>6.1} Mbit/s  latency avg {:>6.1} ms max {:>6.1} ms  rtt {:>5.1} ms  missing {} (stale {})  sink dropped {}",
             self.frames,
             self.bytes as f64 * 8.0 / 1e6,
             avg_ms,
@@ -291,6 +311,7 @@ impl Stats {
             conn.rtt().as_secs_f64() * 1000.0,
             self.missing,
             stale,
+            sink_dropped,
         );
         *self = Stats {
             last_seq: self.last_seq,
