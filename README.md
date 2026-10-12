@@ -3,8 +3,9 @@
 Share a USB webcam over the network. See [DESIGN.md](DESIGN.md) for the
 protocol and roadmap.
 
-Current state: **M3**. The server captures MJPEG from a V4L2 camera and sends
-it over QUIC. The client decodes it into a v4l2loopback device, where any app
+Current state: **M4**. The server captures MJPEG from a V4L2 camera and sends
+it over QUIC, either as is or re-encoded to H.264 at a bitrate that adapts to
+the link. The client decodes it into a v4l2loopback device, where any app
 (OBS, browsers, Zoom, ffmpeg) sees it as a normal YUYV webcam. Servers are
 found on the LAN via mDNS, camera controls (exposure, focus, white balance,
 ...) can be set from the client, and the client reconnects by itself if the
@@ -15,6 +16,7 @@ connection drops.
 | Crate | Role |
 |---|---|
 | `remcam-proto` | Wire messages, framing, QUIC/TLS config (fingerprint-pinned self-signed certs) |
+| `remcam-codec` | JPEG decoding, YUV conversions, H.264 encode/decode (OpenH264) |
 | `remcam-server` | Runs on the machine with the camera |
 | `remcam-client` | Runs on the machine that wants the camera |
 
@@ -47,9 +49,55 @@ startup output.
 
 `--size` defaults to 1280x720 (or the largest size offered), and `--fps` to
 the highest rate at that size. Requests the camera doesn't offer are rejected
-with the list of valid options. Other options: `--out DIR` saves frames as
-JPEG, `--frames N` stops after N frames, and `--stats SECS` sets the
+with the list of valid options. Other options: `--out DIR` saves frames
+(`DIR/<seq>.jpg` for MJPEG, `DIR/stream.h264` for H.264, playable with
+`ffplay`), `--frames N` stops after N frames, and `--stats SECS` sets the
 statistics interval (0 turns it off).
+
+### H.264 or MJPEG
+
+`--codec h264` (the default) has the server decode the camera's JPEG frames
+and re-encode them with OpenH264. `--codec mjpeg` passes the camera's frames
+through untouched. Measured on one i5-8250U with server and client on the
+same machine, with a deliberately noisy picture (dark room, brightness and
+gamma at maximum), which is a hard case for any encoder:
+
+| 30 fps | Bitrate | Latency |
+|---|---|---|
+| MJPEG 720p | 110 Mbit/s | 36 ms |
+| H.264 720p | 2.8 Mbit/s (default cap) | 50 ms |
+| MJPEG 1080p | 178 Mbit/s | 37 ms |
+| H.264 1080p | 6.2 Mbit/s (default cap) | 60 ms |
+
+MJPEG costs the server almost nothing. H.264 at 1080p costs it about 26 ms of
+CPU per frame on this machine (JPEG decode 13 ms, conversion 2.5 ms, encode
+10.5 ms spread over several threads), so slower machines may need 720p.
+
+A clean, well-lit picture needs far less bitrate for MJPEG (typically
+20–60 Mbit/s), so MJPEG is the better choice on wired LAN or good Wi-Fi,
+when latency or picture quality matter most. H.264 is the right choice for
+anything slower or shared.
+
+`--bitrate KBPS` caps the H.264 bitrate. The default cap is 0.1 bits per
+pixel (2765 kbit/s for 720p30). Below the cap, the server adapts to the link:
+it backs off when frames pile up unacknowledged, when QUIC reports loss, or
+when the round-trip time rises; it creeps back up when the link is clear. It
+logs each step down. Through a test relay that throttled the link from 4 to
+1.5 to 0.8 Mbit/s and back, it settled within about 5 s of each change with
+latency peaking around 350 ms, kept 30 fps, and returned to the cap within
+about 25 s of the link recovering.
+
+H.264 frames depend on earlier ones, so the client decodes them strictly in
+order. If it ever has to skip one (it fell too far behind), it asks the
+server for a keyframe and shows the last good picture until then. The
+stats line counts keyframes.
+
+OpenH264 is built from source (bundled with the `openh264` crate; needs a C++
+compiler). At startup of each H.264 stream it prints a warning that "bitrate
+can't be controlled ... without enabling skip frame"; that is expected, since
+remcam drops frames itself before encoding and the bitrate does track the
+target. Note that Cisco's H.264 patent license covers only its prebuilt
+OpenH264 binaries, not builds from source.
 
 ### Camera controls
 
@@ -93,7 +141,8 @@ device as a camera. To load the module at boot, put `v4l2loopback` in
 `options v4l2loopback video_nr=10 card_label=remcam exclusive_caps=1` in
 `/etc/modprobe.d/remcam.conf`.
 
-The client decodes with libjpeg-turbo by default (Debian: `libturbojpeg0-dev`),
+JPEG frames (MJPEG on the client, and the camera's frames on the server for
+H.264) are decoded with libjpeg-turbo by default (Debian: `libturbojpeg0-dev`),
 straight to YUV. Build with `--no-default-features` to use the pure-Rust
 `zune-jpeg` decoder instead, with no system dependency. At 1080p on an
 i5-8250U (powersave governor):
@@ -106,3 +155,12 @@ i5-8250U (powersave governor):
 The time that matters is the live-pacing one, because the CPU doesn't boost
 between frames. At 30 fps the budget is 33 ms per frame. If the decoder falls
 behind, the newest frame wins and the stats line reports `sink dropped`.
+
+To measure the H.264 path on your own machine, record some camera frames and
+run the benchmark:
+
+```sh
+ffmpeg -f v4l2 -input_format mjpeg -video_size 1280x720 -i /dev/video0 \
+    -frames:v 90 -c copy frames/%03d.jpg
+cargo run --release -p remcam-codec --example h264_bench -- frames [KBPS] [FPS]
+```

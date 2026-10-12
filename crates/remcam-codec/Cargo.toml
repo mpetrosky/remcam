@@ -1,0 +1,20 @@
+[package]
+name = "remcam-codec"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+# Builds OpenH264 from bundled source (needs a C++ compiler; uses nasm for
+# x86 SIMD when it is installed, plain C otherwise).
+openh264 = "0.9.8"
+openh264-sys2 = { version = "0.9.8", default-features = false }
+tracing = "0.1.44"
+turbojpeg = { version = "0.5.4", default-features = false, features = ["pkg-config"], optional = true }
+zune-jpeg = "0.5.15"
+
+[features]
+# Decode JPEG via the system libjpeg-turbo (Debian: libturbojpeg0-dev),
+# straight to YUV, about 2x faster than the pure-Rust fallback.
+default = ["turbojpeg"]
+turbojpeg = ["dep:turbojpeg"]

@@ -35,10 +35,10 @@ camera already compresses for us.
  machine A (camera host)                          machine B (consumer)
 ┌──────────────────────────┐   QUIC (TLS 1.3)  ┌────────────────────────────┐
 │ remcam-server            │ ────────────────▶ │ remcam-client              │
-│  V4L2 capture (mmap)     │  control: bidi    │  decode MJPEG → YUYV/I420  │
-│  MJPEG passthrough       │  video:   1 uni   │  write to v4l2loopback     │
-│  [later: H.264 encoder]  │  stream per frame │  /dev/videoN ← Zoom, OBS,  │
-│  ctrl get/set            │                   │                browser...  │
+│  V4L2 capture (mmap)     │  control: bidi    │  decode MJPEG → YUYV,      │
+│  MJPEG passthrough, or   │  video:   1 uni   │  or H.264 → YUYV, write to │
+│  H.264 (OpenH264) + ABR  │  stream per frame │  v4l2loopback /dev/videoN  │
+│  ctrl get/set            │                   │  ← Zoom, OBS, browser...   │
 └──────────────────────────┘                   └────────────────────────────┘
         ▲ mDNS advertise  _remcam._udp.local
 ```
@@ -74,36 +74,44 @@ is the leanest Rust option).
 - Later: a PipeWire video source node (`pipewire` crate) for portal-based
   apps (Flatpak browsers), with no kernel module needed.
 
-## 3. Wire protocol (v1)
+## 3. Wire protocol (v2)
 
-ALPN `remcam/1`. Messages are `serde` + `postcard` with a u32 length prefix.
+ALPN `remcam/2`. Messages are `serde` + `postcard` with a u32 length prefix.
 The authoritative definitions are in `crates/remcam-proto/src/lib.rs`.
 
 Control stream (client ↔ server):
 ```
 → Hello        { version, client_name }
-← Hello        { version, server_name }
+← Hello        { version, server_name, codecs }
 ← DeviceList   { devices: [ {id, name,
                              formats: [{fourcc, sizes: [{w, h, fps[]}]}],
                              controls: [{id, name, kind, default, state, read_only}]} ] }
-→ Open         { device_id, format: {fourcc, w, h, fps} }
-← Opened       { epoch, format }          // what the driver actually accepted
+→ Open         { device_id, format: {fourcc, w, h, fps},
+                 stream: {codec: Mjpeg|H264, max_bitrate} }
+← Opened       { epoch, format, stream }  // what was actually set up
 ← Controls     { [ {id, value, inactive} ] }   // after Opened and every SetControl
 → SetControl   { id, value }              // validated server-side against DeviceList
+→ RequestKeyframe                          // H.264: client had to skip a frame
 → Close
 ← Error        { msg }
 ```
-Planned: `codec` in `Open`, plus `RequestKeyframe` and `Bitrate` (M4).
+`format` is what the camera captures (always MJPEG for now); `stream.codec`
+is what goes on the wire. The bitrate is adapted by the server alone, so no
+bitrate messages are needed.
 
 Video (server → client), one uni stream per frame:
 ```
-FrameHeader { epoch, seq: u64, capture_ts_us: u64, len: u32 }
+FrameHeader { epoch, seq: u64, capture_ts_us: u64, len: u32, keyframe: bool }
 <payload bytes>
 ```
+The server opens frame streams in frame order. MJPEG frames are independent,
+so the client keeps only the newest and stops stale streams. H.264 frames are
+read concurrently but delivered in stream order. The H.264 stream has no
+periodic keyframes, only one at the start and one per `RequestKeyframe`,
+because QUIC already delivers every frame and keyframes are latency spikes.
 `capture_ts_us` comes from the V4L2 buffer timestamp (CLOCK_MONOTONIC),
 converted to wall-clock time. It's used for latency measurement and, later,
-A/V sync if a mic is forwarded. A `keyframe` flag is added with H.264 (M4).
-
+A/V sync if a mic is forwarded.
 Discovery: servers advertise `_remcam._udp.local.` with TXT `v` (protocol
 version) and `fp` (certificate fingerprint). Loopback addresses aren't
 advertised.
@@ -145,8 +153,15 @@ advertised.
    commands; controls are set through a second V4L2 handle while streaming),
    mDNS discovery, reconnection with backoff that keeps the loopback device
    open, and stale-frame dropping (client stops superseded frame streams).
-4. **M4:** H.264 encode, keyframe requests, and adaptive bitrate from QUIC
-   stats. Wi-Fi becomes reliable.
+4. **M4 (done):** H.264 via OpenH264 (`remcam-codec` crate, shared with the
+   client's JPEG path). The server decodes the camera's JPEG to I420
+   (limited range), encodes with multi-threaded slices, and drops frames
+   *before* encoding when 4 are unacknowledged, so the encoder never
+   references a frame the client won't get. Adaptive bitrate: multiplicative
+   decrease on backed-up frames (×0.7), QUIC congestion events with >2%
+   loss, or RTT doubling (×0.85); ×1.08 per second increase after a 3 s
+   hold. The client decodes in order and requests a keyframe if it ever has
+   to skip a frame. MJPEG passthrough remains as `--codec mjpeg`.
 5. **M5 (WAN):** auth with an SSH-style trust-on-first-use cert fingerprint or
    a pairing code, NAT traversal (`iroh`, or "use Tailscale/WireGuard" as the
    zero-effort answer), and a relay fallback.
@@ -161,6 +176,16 @@ advertised.
   `timeout_image`) would be clearer.
 - **Controls from apps:** apps can't change controls through the loopback
   device (v4l2loopback doesn't pass them through), only through the client.
+- **Hardware H.264:** VAAPI (Intel/AMD) or V4L2 M2M (Raspberry Pi) would take
+  the encode cost off the server's CPU, and some cameras (e.g. older C920s)
+  can emit H.264 themselves. OpenH264 is the portable baseline.
+- **Raw camera formats:** at small sizes, capturing YUYV directly would skip
+  the server's JPEG decode for H.264.
+- **Frame timestamps on the loopback device:** frames are written with
+  `write()`, so v4l2loopback stamps them on arrival. ffmpeg reading the
+  device warns about non-monotonic timestamps now and then. Writing through
+  queued buffers with the capture timestamp would fix that and could also
+  smooth jitter.
 
 - **On-demand capture:** start the camera only when an app opens the loopback
   device. v4l2loopback offers no clean open/close event, so we'd need to poll
