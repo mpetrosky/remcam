@@ -117,7 +117,10 @@ pub fn client_config(trust: ServerTrust) -> anyhow::Result<quinn::ClientConfig> 
 
     let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
     let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    // A vanished server is only noticed when the connection goes idle; keep
+    // that short so the client can start reconnecting quickly.
+    transport.keep_alive_interval(Some(Duration::from_secs(2)));
+    transport.max_idle_timeout(Some(Duration::from_secs(6).try_into()?));
     // Each in-flight frame occupies one uni stream; leave headroom for bursts.
     transport.max_concurrent_uni_streams(256u32.into());
     config.transport_config(Arc::new(transport));

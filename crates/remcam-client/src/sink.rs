@@ -25,6 +25,8 @@ const LOOPBACK_DRIVER: &str = "v4l2 loopback";
 /// Handle to the thread that decodes frames and writes them to the device.
 pub struct Sink {
     tx: SyncSender<Vec<u8>>,
+    thread: thread::JoinHandle<()>,
+    pub format: VideoFormat,
     /// Frames discarded because the decoder was still busy with the previous one.
     pub dropped: Arc<AtomicU64>,
 }
@@ -35,7 +37,7 @@ impl Sink {
         let writer = LoopbackWriter::open(path, format)?;
         let (tx, rx) = sync_channel::<Vec<u8>>(1);
         let dropped = Arc::new(AtomicU64::new(0));
-        thread::Builder::new()
+        let thread = thread::Builder::new()
             .name("remcam-sink".into())
             .spawn(move || {
                 let mut writer = writer;
@@ -46,7 +48,19 @@ impl Sink {
                 }
                 debug!("sink thread exiting");
             })?;
-        Ok(Self { tx, dropped })
+        Ok(Self {
+            tx,
+            thread,
+            format,
+            dropped,
+        })
+    }
+
+    /// Stop the writer and wait until the device is closed, so it can be
+    /// reopened (e.g. with another size) right away.
+    pub fn close(self) {
+        drop(self.tx);
+        let _ = self.thread.join();
     }
 
     /// Hand a frame to the writer, dropping it if the writer is still busy:

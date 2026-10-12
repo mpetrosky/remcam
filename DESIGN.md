@@ -74,29 +74,39 @@ is the leanest Rust option).
 - Later: a PipeWire video source node (`pipewire` crate) for portal-based
   apps (Flatpak browsers), with no kernel module needed.
 
-## 3. Wire protocol (v0 sketch)
+## 3. Wire protocol (v1)
 
-ALPN `remcam/0`. Messages are `serde` + `postcard` with a u32 length prefix.
+ALPN `remcam/1`. Messages are `serde` + `postcard` with a u32 length prefix.
+The authoritative definitions are in `crates/remcam-proto/src/lib.rs`.
 
 Control stream (client ↔ server):
 ```
-Hello        { version, client_name }
-DeviceList   { devices: [ {id, name, formats: [{fourcc, w, h, fps[]}], controls: [...] } ] }
-Open         { device_id, fourcc, w, h, fps, codec: Passthrough | H264 { bitrate } }
-Opened       { stream_epoch }
-SetControl   { id, value }   /  ControlChanged { id, value }
-RequestKeyframe               // H.264 only
-Bitrate      { target_kbps }  // client- or server-driven ABR
-Close / Error { code, msg }
+→ Hello        { version, client_name }
+← Hello        { version, server_name }
+← DeviceList   { devices: [ {id, name,
+                             formats: [{fourcc, sizes: [{w, h, fps[]}]}],
+                             controls: [{id, name, kind, default, state, read_only}]} ] }
+→ Open         { device_id, format: {fourcc, w, h, fps} }
+← Opened       { epoch, format }          // what the driver actually accepted
+← Controls     { [ {id, value, inactive} ] }   // after Opened and every SetControl
+→ SetControl   { id, value }              // validated server-side against DeviceList
+→ Close
+← Error        { msg }
 ```
+Planned: `codec` in `Open`, plus `RequestKeyframe` and `Bitrate` (M4).
 
 Video (server → client), one uni stream per frame:
 ```
-FrameHeader { epoch, seq: u64, capture_ts_us: u64, keyframe: bool, len: u32 }
+FrameHeader { epoch, seq: u64, capture_ts_us: u64, len: u32 }
 <payload bytes>
 ```
-`capture_ts_us` comes from the V4L2 buffer timestamp (CLOCK_MONOTONIC). It's
-used for latency measurement and, later, A/V sync if a mic is forwarded.
+`capture_ts_us` comes from the V4L2 buffer timestamp (CLOCK_MONOTONIC),
+converted to wall-clock time. It's used for latency measurement and, later,
+A/V sync if a mic is forwarded. A `keyframe` flag is added with H.264 (M4).
+
+Discovery: servers advertise `_remcam._udp.local.` with TXT `v` (protocol
+version) and `fp` (certificate fingerprint). Loopback addresses aren't
+advertised.
 
 ## 4. Crates
 
@@ -130,8 +140,11 @@ used for latency measurement and, later, A/V sync if a mic is forwarded.
    so JPEG→RGB→YUYV) is the fallback without the `turbojpeg` feature, and for
    chroma layouts other than 4:2:2/4:2:0. Note that the `turbojpeg` crate 1.x
    requires libjpeg-turbo ≥ 3.0, but Debian trixie ships 2.1.5, so we pin 0.5.x.
-3. **M3:** device and format negotiation, camera control forwarding, mDNS
-   discovery, reconnection, and stale-frame dropping.
+3. **M3 (done):** format negotiation (sizes and frame rates validated
+   client-side), camera control forwarding (`--ctrl` plus interactive
+   commands; controls are set through a second V4L2 handle while streaming),
+   mDNS discovery, reconnection with backoff that keeps the loopback device
+   open, and stale-frame dropping (client stops superseded frame streams).
 4. **M4:** H.264 encode, keyframe requests, and adaptive bitrate from QUIC
    stats. Wi-Fi becomes reliable.
 5. **M5 (WAN):** auth with an SSH-style trust-on-first-use cert fingerprint or
@@ -139,6 +152,15 @@ used for latency measurement and, later, A/V sync if a mic is forwarded.
    zero-effort answer), and a relay fallback.
 
 ## 6. Open questions
+
+- **Trusting discovered servers:** mDNS advertises the fingerprint, but it's
+  unauthenticated, so the client still requires `--fingerprint`. Fix in M5
+  with trust-on-first-use (a `known_hosts`-style file) or a pairing code.
+- **Placeholder while disconnected:** apps currently see the last frame
+  frozen during a reconnect. A "reconnecting" card (or v4l2loopback's
+  `timeout_image`) would be clearer.
+- **Controls from apps:** apps can't change controls through the loopback
+  device (v4l2loopback doesn't pass them through), only through the client.
 
 - **On-demand capture:** start the camera only when an app opens the loopback
   device. v4l2loopback offers no clean open/close event, so we'd need to poll

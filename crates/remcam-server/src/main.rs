@@ -1,6 +1,7 @@
 //! remcam-server: shares local V4L2 cameras over QUIC.
 
 mod camera;
+mod mdns;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -12,7 +13,7 @@ use remcam_proto::{ClientMsg, FrameHeader, PROTOCOL_VERSION, ServerMsg, read_msg
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
-use crate::camera::{Capture, Frame};
+use crate::camera::{Capture, Controls, Frame};
 
 /// Frames handed to QUIC but not yet fully written. Beyond this, new frames
 /// are dropped instead of queued, which bounds latency when the link is slow.
@@ -30,9 +31,13 @@ struct Args {
     #[arg(long)]
     config_dir: Option<PathBuf>,
 
-    /// Print the available cameras and exit.
+    /// Print the available cameras, their formats and controls, and exit.
     #[arg(long)]
     list: bool,
+
+    /// Don't advertise this server on the LAN via mDNS.
+    #[arg(long)]
+    no_mdns: bool,
 }
 
 #[tokio::main]
@@ -45,13 +50,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     if args.list {
-        for dev in camera::list_devices() {
-            println!("{}  {}", dev.id, dev.name);
-            for f in &dev.formats {
-                let sizes: Vec<_> = f.sizes.iter().map(|(w, h)| format!("{w}x{h}")).collect();
-                println!("    {}: {}", f.fourcc, sizes.join(" "));
-            }
-        }
+        print_devices(&camera::list_devices());
         return Ok(());
     }
 
@@ -68,6 +67,18 @@ async fn main() -> anyhow::Result<()> {
     info!("certificate fingerprint: {fingerprint}");
 
     let server_name = hostname();
+    // Kept alive for the lifetime of the server; dropping it stops advertising.
+    let _mdns = if args.no_mdns {
+        None
+    } else {
+        match mdns::advertise(&server_name, endpoint.local_addr()?, &fingerprint) {
+            Ok(daemon) => daemon,
+            Err(e) => {
+                warn!("mDNS advertisement failed: {e:#}");
+                None
+            }
+        }
+    };
     while let Some(incoming) = endpoint.accept().await {
         let server_name = server_name.clone();
         tokio::spawn(async move {
@@ -119,28 +130,35 @@ async fn handle_connection(incoming: quinn::Incoming, server_name: String) -> an
     )
     .await?;
 
-    let mut active: Option<Capture> = None;
+    let mut active: Option<(Capture, Arc<Controls>)> = None;
     let mut epoch = 0u32;
     // The control stream ending (or the connection dropping) ends the session.
     while let Ok(msg) = read_msg::<_, ClientMsg>(&mut ctl_rx).await {
         match msg {
             ClientMsg::Open { device_id, format } => {
-                if let Some(capture) = active.take() {
+                if let Some((capture, _)) = active.take() {
                     capture.stop().await;
                 }
                 // Only devices we advertised may be opened; never an arbitrary path.
-                if !devices.iter().any(|d| d.id == device_id) {
+                let Some(device) = devices.iter().find(|d| d.id == device_id) else {
                     let msg = format!("unknown device {device_id}");
                     write_msg(&mut ctl_tx, &ServerMsg::Error { msg }).await?;
                     continue;
-                }
+                };
+                let controls = match Controls::open(&device_id, device.controls.clone()) {
+                    Ok(c) => Arc::new(c),
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        write_msg(&mut ctl_tx, &ServerMsg::Error { msg }).await?;
+                        continue;
+                    }
+                };
                 epoch += 1;
                 let (tx, rx) = mpsc::channel(1);
                 match Capture::start(device_id.clone(), format, tx).await {
                     Ok((capture, actual)) => {
                         info!("{remote}: streaming {device_id} as {actual}");
                         tokio::spawn(send_frames(conn.clone(), epoch, rx));
-                        active = Some(capture);
                         write_msg(
                             &mut ctl_tx,
                             &ServerMsg::Opened {
@@ -149,6 +167,8 @@ async fn handle_connection(incoming: quinn::Incoming, server_name: String) -> an
                             },
                         )
                         .await?;
+                        send_control_states(&mut ctl_tx, &controls).await?;
+                        active = Some((capture, controls));
                     }
                     Err(e) => {
                         let msg = format!("{e:#}");
@@ -157,8 +177,25 @@ async fn handle_connection(incoming: quinn::Incoming, server_name: String) -> an
                     }
                 }
             }
+            ClientMsg::SetControl { id, value } => {
+                let Some((_, controls)) = &active else {
+                    let msg = "no device open".to_string();
+                    write_msg(&mut ctl_tx, &ServerMsg::Error { msg }).await?;
+                    continue;
+                };
+                let c = controls.clone();
+                match tokio::task::spawn_blocking(move || c.set(id, value)).await? {
+                    Ok(()) => debug!("{remote}: control {id:#x} = {value}"),
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        write_msg(&mut ctl_tx, &ServerMsg::Error { msg }).await?;
+                    }
+                }
+                // Report the outcome either way, so the client stays in sync.
+                send_control_states(&mut ctl_tx, controls).await?;
+            }
             ClientMsg::Close => {
-                if let Some(capture) = active.take() {
+                if let Some((capture, _)) = active.take() {
                     capture.stop().await;
                 }
             }
@@ -168,10 +205,30 @@ async fn handle_connection(incoming: quinn::Incoming, server_name: String) -> an
             }
         }
     }
-    if let Some(capture) = active.take() {
+    if let Some((capture, _)) = active.take() {
         capture.stop().await;
     }
     Ok(())
+}
+
+async fn send_control_states(
+    ctl_tx: &mut quinn::SendStream,
+    controls: &Arc<Controls>,
+) -> anyhow::Result<()> {
+    let c = controls.clone();
+    match tokio::task::spawn_blocking(move || c.states()).await? {
+        Ok(controls) => write_msg(ctl_tx, &ServerMsg::Controls { controls }).await,
+        Err(e) => {
+            warn!("reading controls failed: {e:#}");
+            Ok(())
+        }
+    }
+}
+
+fn print_devices(devices: &[remcam_proto::DeviceInfo]) {
+    for dev in devices {
+        print!("{}", dev.describe());
+    }
 }
 
 /// Send each captured frame on its own unidirectional stream.
