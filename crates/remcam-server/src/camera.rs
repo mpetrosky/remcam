@@ -293,7 +293,15 @@ fn configure(path: &str, req: VideoFormat) -> anyhow::Result<(Stream<'static>, V
     fmt.width = req.width;
     fmt.height = req.height;
     fmt.fourcc = v4l::FourCC::new(&req.fourcc.0);
-    let fmt = dev.set_format(&fmt).context("setting format")?;
+    let fmt = dev.set_format(&fmt).map_err(|e| {
+        let hint = if e.raw_os_error() == Some(libc::EBUSY) {
+            " (the camera is in use by another program, or by a remcam client \
+             that disconnected without closing; that frees up within seconds)"
+        } else {
+            ""
+        };
+        anyhow::anyhow!("setting format: {e}{hint}")
+    })?;
     if fmt.fourcc.repr != req.fourcc.0 {
         bail!("device does not support {}", req.fourcc);
     }

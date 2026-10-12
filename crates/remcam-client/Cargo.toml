@@ -9,18 +9,17 @@ clap = { version = "4.6.7", features = ["derive"] }
 libc = "0.2.190"
 mdns-sd = "0.21.5"
 quinn = "0.11.12"
+remcam-codec = { version = "0.1.0", path = "../remcam-codec", default-features = false }
 remcam-proto = { version = "0.1.0", path = "../remcam-proto" }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "logging"] }
 tokio = { version = "1.53.2", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-turbojpeg = { version = "0.5.4", default-features = false, features = ["pkg-config"], optional = true }
 v4l = "0.14.0"
-zune-jpeg = "0.5.15"
 
 [features]
-# Decode via the system libjpeg-turbo (Debian: libturbojpeg0-dev), straight to
-# YUV, about 2x faster than the pure-Rust fallback. Build without it using
+# Decode MJPEG via the system libjpeg-turbo (Debian: libturbojpeg0-dev),
+# about 2x faster than the pure-Rust fallback. Build without it using
 # --no-default-features.
 default = ["turbojpeg"]
-turbojpeg = ["dep:turbojpeg"]
+turbojpeg = ["remcam-codec/turbojpeg"]

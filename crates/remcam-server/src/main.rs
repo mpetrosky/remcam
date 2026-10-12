@@ -2,6 +2,8 @@
 
 mod camera;
 mod mdns;
+mod pipeline;
+mod rate;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -9,15 +11,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use clap::Parser;
-use remcam_proto::{ClientMsg, FrameHeader, PROTOCOL_VERSION, ServerMsg, read_msg, tls, write_msg};
-use tokio::sync::{Semaphore, mpsc};
+use remcam_proto::{ClientMsg, Codec, PROTOCOL_VERSION, ServerMsg, read_msg, tls, write_msg};
 use tracing::{debug, info, warn};
 
-use crate::camera::{Capture, Controls, Frame};
-
-/// Frames handed to QUIC but not yet fully written. Beyond this, new frames
-/// are dropped instead of queued, which bounds latency when the link is slow.
-const MAX_INFLIGHT_FRAMES: usize = 4;
+use crate::camera::Controls;
+use crate::pipeline::Pipeline;
 
 #[derive(Parser)]
 #[command(about = "Share local webcams over the network")]
@@ -117,6 +115,7 @@ async fn handle_connection(incoming: quinn::Incoming, server_name: String) -> an
         &ServerMsg::Hello {
             version: PROTOCOL_VERSION,
             server_name,
+            codecs: vec![Codec::Mjpeg, Codec::H264],
         },
     )
     .await?;
@@ -130,14 +129,18 @@ async fn handle_connection(incoming: quinn::Incoming, server_name: String) -> an
     )
     .await?;
 
-    let mut active: Option<(Capture, Arc<Controls>)> = None;
+    let mut active: Option<(Pipeline, Arc<Controls>)> = None;
     let mut epoch = 0u32;
     // The control stream ending (or the connection dropping) ends the session.
     while let Ok(msg) = read_msg::<_, ClientMsg>(&mut ctl_rx).await {
         match msg {
-            ClientMsg::Open { device_id, format } => {
-                if let Some((capture, _)) = active.take() {
-                    capture.stop().await;
+            ClientMsg::Open {
+                device_id,
+                format,
+                stream,
+            } => {
+                if let Some((pipeline, _)) = active.take() {
+                    pipeline.stop().await;
                 }
                 // Only devices we advertised may be opened; never an arbitrary path.
                 let Some(device) = devices.iter().find(|d| d.id == device_id) else {
@@ -154,21 +157,31 @@ async fn handle_connection(incoming: quinn::Incoming, server_name: String) -> an
                     }
                 };
                 epoch += 1;
-                let (tx, rx) = mpsc::channel(1);
-                match Capture::start(device_id.clone(), format, tx).await {
-                    Ok((capture, actual)) => {
-                        info!("{remote}: streaming {device_id} as {actual}");
-                        tokio::spawn(send_frames(conn.clone(), epoch, rx));
+                match Pipeline::start(conn.clone(), epoch, device_id.clone(), format, stream).await
+                {
+                    Ok((pipeline, actual, stream)) => {
+                        match stream.max_bitrate {
+                            Some(max) => info!(
+                                "{remote}: streaming {device_id} ({actual}) as {}, up to {:.2} Mbit/s",
+                                stream.codec,
+                                max as f64 / 1e6
+                            ),
+                            None => info!(
+                                "{remote}: streaming {device_id} ({actual}) as {}",
+                                stream.codec
+                            ),
+                        }
                         write_msg(
                             &mut ctl_tx,
                             &ServerMsg::Opened {
                                 epoch,
                                 format: actual,
+                                stream,
                             },
                         )
                         .await?;
                         send_control_states(&mut ctl_tx, &controls).await?;
-                        active = Some((capture, controls));
+                        active = Some((pipeline, controls));
                     }
                     Err(e) => {
                         let msg = format!("{e:#}");
@@ -194,9 +207,14 @@ async fn handle_connection(incoming: quinn::Incoming, server_name: String) -> an
                 // Report the outcome either way, so the client stays in sync.
                 send_control_states(&mut ctl_tx, controls).await?;
             }
+            ClientMsg::RequestKeyframe => {
+                if let Some((pipeline, _)) = &active {
+                    pipeline.request_keyframe();
+                }
+            }
             ClientMsg::Close => {
-                if let Some((capture, _)) = active.take() {
-                    capture.stop().await;
+                if let Some((pipeline, _)) = active.take() {
+                    pipeline.stop().await;
                 }
             }
             ClientMsg::Hello { .. } => {
@@ -205,8 +223,8 @@ async fn handle_connection(incoming: quinn::Incoming, server_name: String) -> an
             }
         }
     }
-    if let Some((capture, _)) = active.take() {
-        capture.stop().await;
+    if let Some((pipeline, _)) = active.take() {
+        pipeline.stop().await;
     }
     Ok(())
 }
@@ -229,42 +247,6 @@ fn print_devices(devices: &[remcam_proto::DeviceInfo]) {
     for dev in devices {
         print!("{}", dev.describe());
     }
-}
-
-/// Send each captured frame on its own unidirectional stream.
-async fn send_frames(conn: quinn::Connection, epoch: u32, mut rx: mpsc::Receiver<Frame>) {
-    let inflight = Arc::new(Semaphore::new(MAX_INFLIGHT_FRAMES));
-    let mut dropped = 0u64;
-    while let Some(frame) = rx.recv().await {
-        let Ok(permit) = inflight.clone().try_acquire_owned() else {
-            dropped += 1;
-            if dropped.is_power_of_two() {
-                debug!("link busy, {dropped} frames dropped so far");
-            }
-            continue;
-        };
-        let conn = conn.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(e) = send_frame(&conn, epoch, frame).await {
-                debug!("frame send failed: {e:#}");
-            }
-        });
-    }
-}
-
-async fn send_frame(conn: &quinn::Connection, epoch: u32, frame: Frame) -> anyhow::Result<()> {
-    let mut stream = conn.open_uni().await?;
-    let header = FrameHeader {
-        epoch,
-        seq: frame.seq,
-        capture_ts_us: frame.capture_ts_us,
-        len: frame.data.len() as u32,
-    };
-    write_msg(&mut stream, &header).await?;
-    stream.write_all(&frame.data).await?;
-    stream.finish()?;
-    Ok(())
 }
 
 fn default_config_dir() -> anyhow::Result<PathBuf> {

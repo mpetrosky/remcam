@@ -9,8 +9,14 @@ clap = { version = "4.6.7", features = ["derive"] }
 libc = "0.2.190"
 mdns-sd = "0.21.5"
 quinn = "0.11.12"
+remcam-codec = { version = "0.1.0", path = "../remcam-codec", default-features = false }
 remcam-proto = { version = "0.1.0", path = "../remcam-proto" }
 tokio = { version = "1.53.2", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 v4l = "0.14.0"
+
+[features]
+# JPEG decoding (for H.264 encoding) via the system libjpeg-turbo; see remcam-codec.
+default = ["turbojpeg"]
+turbojpeg = ["remcam-codec/turbojpeg"]

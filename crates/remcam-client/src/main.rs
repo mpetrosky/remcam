@@ -1,13 +1,14 @@
 //! remcam-client: receives a camera stream from remcam-server.
 //!
 //! Frames can be fed to a v4l2loopback device (`--sink`), so local apps see
-//! the remote camera as a normal webcam, and/or saved as JPEG files (`--out`).
+//! the remote camera as a normal webcam, and/or saved to files (`--out`).
+//! They travel as the camera's own MJPEG or as H.264 with a bitrate that
+//! adapts to the link (`--codec`).
 //! Camera controls can be set at startup (`--ctrl`) or typed while streaming.
 //! If the connection drops after streaming has started, the client keeps the
 //! loopback device open and reconnects.
 
 mod controls;
-mod decode;
 mod discover;
 mod sink;
 
@@ -19,12 +20,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use remcam_proto::tls::{self, ServerTrust};
 use remcam_proto::{
-    ClientMsg, ControlInfo, ControlState, DeviceInfo, FourCC, FrameHeader, MAX_FRAME_LEN,
-    PROTOCOL_VERSION, SERVER_NAME, ServerMsg, VideoFormat, read_msg, write_msg,
+    ClientMsg, Codec, ControlInfo, ControlState, DeviceInfo, FourCC, FrameHeader, MAX_FRAME_LEN,
+    PROTOCOL_VERSION, SERVER_NAME, ServerMsg, StreamOptions, VideoFormat, read_msg, write_msg,
 };
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -64,6 +66,17 @@ struct Args {
     #[arg(long)]
     fps: Option<u32>,
 
+    /// How frames travel: h264 adapts its bitrate to the link (Wi-Fi, WAN);
+    /// mjpeg passes the camera's frames through (wired LAN, lowest latency,
+    /// 20-60 Mbit/s).
+    #[arg(long, value_enum, default_value_t = CodecArg::H264)]
+    codec: CodecArg,
+
+    /// Maximum H.264 bitrate in kbit/s. Defaults to 0.1 bits per pixel,
+    /// e.g. 2765 for 1280x720 at 30 fps.
+    #[arg(long, value_name = "KBPS")]
+    bitrate: Option<u32>,
+
     /// Set a camera control after opening, e.g. --ctrl brightness=10. Repeatable.
     #[arg(long = "ctrl", value_name = "NAME=VALUE")]
     ctrls: Vec<String>,
@@ -80,7 +93,7 @@ struct Args {
     #[arg(long, value_name = "DEVICE")]
     sink: Option<String>,
 
-    /// Save each received frame as DIR/<seq>.jpg.
+    /// Save MJPEG frames as DIR/<seq>.jpg, or H.264 as DIR/stream.h264.
     #[arg(long, value_name = "DIR")]
     out: Option<PathBuf>,
 
@@ -91,6 +104,21 @@ struct Args {
     /// Seconds between statistics lines; 0 disables them.
     #[arg(long, default_value_t = 5)]
     stats: u64,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CodecArg {
+    H264,
+    Mjpeg,
+}
+
+impl From<CodecArg> for Codec {
+    fn from(c: CodecArg) -> Self {
+        match c {
+            CodecArg::H264 => Codec::H264,
+            CodecArg::Mjpeg => Codec::Mjpeg,
+        }
+    }
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32), String> {
@@ -171,9 +199,16 @@ async fn main() -> anyhow::Result<()> {
     let mut endpoint = quinn::Endpoint::client(bind)?;
     endpoint.set_default_client_config(tls::client_config(trust)?);
 
+    // Ctrl-C or SIGTERM (e.g. from systemd or `timeout`) end the stream
+    // cleanly, so the server releases the camera right away instead of
+    // waiting for the connection to time out.
     let (quit_tx, mut quit_rx) = watch::channel(false);
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
         let _ = quit_tx.send(true);
     });
     let mut commands = spawn_command_reader();
@@ -324,17 +359,19 @@ async fn stream(
     )
     .await?;
 
-    match read_msg(&mut ctl_rx).await? {
+    let codecs = match read_msg(&mut ctl_rx).await? {
         ServerMsg::Hello {
             version,
             server_name,
+            codecs,
         } if version == PROTOCOL_VERSION => {
             info!("connected to {server_name} ({})", conn.remote_address());
+            codecs
         }
         ServerMsg::Hello { version, .. } => bail!("server speaks protocol version {version}"),
         ServerMsg::Error { msg } => bail!("server error: {msg}"),
         other => bail!("expected Hello, got {other:?}"),
-    }
+    };
     let ServerMsg::DeviceList { devices } = read_msg(&mut ctl_rx).await? else {
         bail!("expected DeviceList");
     };
@@ -346,19 +383,38 @@ async fn stream(
     }
     let device = pick_device(&devices, args.device.as_deref())?;
     let format = pick_format(device, args.size, args.fps)?;
+    let codec = Codec::from(args.codec);
+    if !codecs.contains(&codec) {
+        bail!("server can't send {codec}");
+    }
 
     write_msg(
         &mut ctl_tx,
         &ClientMsg::Open {
             device_id: device.id.clone(),
             format,
+            stream: StreamOptions {
+                codec,
+                max_bitrate: args.bitrate.map(|k| k.saturating_mul(1000)),
+            },
         },
     )
     .await?;
-    let (epoch, actual) = match read_msg(&mut ctl_rx).await? {
-        ServerMsg::Opened { epoch, format } => {
-            info!("streaming {} ({}) as {format}", device.id, device.name);
-            (epoch, format)
+    let (epoch, actual, codec) = match read_msg(&mut ctl_rx).await? {
+        ServerMsg::Opened {
+            epoch,
+            format,
+            stream,
+        } => {
+            let rate = stream
+                .max_bitrate
+                .map(|b| format!(", up to {:.2} Mbit/s", b as f64 / 1e6))
+                .unwrap_or_default();
+            info!(
+                "streaming {} ({}) {format} as {}{rate}",
+                device.id, device.name, stream.codec
+            );
+            (epoch, format, stream.codec)
         }
         ServerMsg::Error { msg } => bail!("server could not open {}: {msg}", device.id),
         other => bail!("expected Opened, got {other:?}"),
@@ -375,8 +431,20 @@ async fn stream(
             state.sink = Some(sink::Sink::start(path, actual)?);
         }
     }
+    // H.264 frames only make sense together, so they go into one file.
+    let mut h264_out = None;
     if let Some(dir) = &args.out {
         tokio::fs::create_dir_all(dir).await?;
+        if codec == Codec::H264 {
+            let path = dir.join("stream.h264");
+            let file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .await
+                .with_context(|| format!("opening {}", path.display()))?;
+            h264_out = Some(file);
+        }
     }
 
     for assignment in &args.ctrls {
@@ -399,7 +467,10 @@ async fn stream(
 
     let (frame_tx, mut frames) = mpsc::channel(8);
     let stale = Arc::new(AtomicU64::new(0));
-    tokio::spawn(accept_frames(conn.clone(), epoch, frame_tx, stale.clone()));
+    match codec {
+        Codec::Mjpeg => tokio::spawn(accept_newest(conn.clone(), epoch, frame_tx, stale.clone())),
+        Codec::H264 => tokio::spawn(accept_in_order(conn.clone(), epoch, frame_tx)),
+    };
 
     let sink_dropped = |state: &State| {
         state
@@ -407,20 +478,39 @@ async fn stream(
             .as_ref()
             .map_or(0, |s| s.dropped.swap(0, Ordering::Relaxed))
     };
-    let mut stats = Stats::new();
+    let mut stats = Stats::new(codec);
     let stats_every = Duration::from_secs(args.stats.max(1));
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + stats_every, stats_every);
 
     let end = loop {
         tokio::select! {
             frame = frames.recv() => {
-                let Some((header, data)) = frame else { bail!("connection lost") };
+                let (header, data) = match frame {
+                    Some(Received::Frame(header, data)) => (header, data),
+                    Some(Received::Lost) => {
+                        if let Some(sink) = &state.sink {
+                            sink.mark_lost();
+                        }
+                        continue;
+                    }
+                    None => bail!("connection lost"),
+                };
                 stats.record(&header, data.len());
-                if let Some(dir) = &args.out {
+                if let Some(file) = &mut h264_out {
+                    file.write_all(&data).await?;
+                } else if let Some(dir) = &args.out {
                     tokio::fs::write(dir.join(format!("{:08}.jpg", header.seq)), &data).await?;
                 }
                 if let Some(sink) = &state.sink {
-                    sink.push(data)?;
+                    sink.push(sink::Frame {
+                        epoch,
+                        codec,
+                        keyframe: header.keyframe,
+                        data,
+                    })?;
+                    if sink.take_keyframe_request() {
+                        write_msg(&mut ctl_tx, &ClientMsg::RequestKeyframe).await?;
+                    }
                 }
                 state.received += 1;
                 if args.frames.is_some_and(|n| state.received >= n) {
@@ -574,13 +664,19 @@ fn pick_format(
     })
 }
 
-/// Accept one unidirectional stream per frame and forward complete frames in
-/// order of arrival. A frame that completes after a newer one has already
-/// been delivered is stale and discarded.
-async fn accept_frames(
+enum Received {
+    Frame(FrameHeader, Vec<u8>),
+    /// A frame stream ended early (H.264 only), so the decoder must resync.
+    Lost,
+}
+
+/// MJPEG: accept one unidirectional stream per frame and forward complete
+/// frames in order of arrival. A frame that completes after a newer one has
+/// already been delivered is stale and discarded.
+async fn accept_newest(
     conn: quinn::Connection,
     epoch: u32,
-    tx: mpsc::Sender<(FrameHeader, Vec<u8>)>,
+    tx: mpsc::Sender<Received>,
     stale: Arc<AtomicU64>,
 ) {
     let newest = Arc::new(AtomicU64::new(0));
@@ -612,12 +708,64 @@ async fn accept_frames(
                 stale.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            let _ = tx.send((header, data)).await;
+            let _ = tx.send(Received::Frame(header, data)).await;
         });
     }
 }
 
+/// H.264: every frame is needed to decode the next, so frames are delivered
+/// in stream order (which the server keeps equal to frame order). Streams
+/// are still read concurrently, so a slow frame doesn't hold up reading the
+/// ones behind it, only delivering them.
+async fn accept_in_order(conn: quinn::Connection, epoch: u32, tx: mpsc::Sender<Received>) {
+    let (order_tx, mut order_rx) = mpsc::channel::<tokio::task::JoinHandle<Option<Received>>>(32);
+    tokio::spawn(async move {
+        while let Some(reader) = order_rx.recv().await {
+            let received = match reader.await {
+                Ok(Some(r)) => r,
+                Ok(None) => continue,
+                Err(_) => Received::Lost,
+            };
+            if tx.send(received).await.is_err() {
+                break;
+            }
+        }
+    });
+    while let Ok(mut stream) = conn.accept_uni().await {
+        let reader = tokio::spawn(async move {
+            let header: FrameHeader = match read_msg(&mut stream).await {
+                Ok(h) => h,
+                Err(e) => {
+                    debug!("bad frame header: {e:#}");
+                    return Some(Received::Lost);
+                }
+            };
+            if header.epoch != epoch {
+                // Left over from an earlier Open; not part of this stream.
+                let _ = stream.stop(0u32.into());
+                return None;
+            }
+            let data = match stream.read_to_end(MAX_FRAME_LEN).await {
+                Ok(d) => d,
+                Err(e) => {
+                    debug!("frame {} incomplete: {e}", header.seq);
+                    return Some(Received::Lost);
+                }
+            };
+            if data.len() != header.len as usize {
+                warn!("frame {}: length mismatch", header.seq);
+                return Some(Received::Lost);
+            }
+            Some(Received::Frame(header, data))
+        });
+        if order_tx.send(reader).await.is_err() {
+            break;
+        }
+    }
+}
+
 struct Stats {
+    codec: Codec,
     since: Instant,
     frames: u64,
     bytes: u64,
@@ -626,11 +774,13 @@ struct Stats {
     last_seq: Option<u64>,
     /// Sequence numbers never delivered: dropped by the server, lost, or stale.
     missing: u64,
+    keyframes: u64,
 }
 
 impl Stats {
-    fn new() -> Self {
+    fn new(codec: Codec) -> Self {
         Self {
+            codec,
             since: Instant::now(),
             frames: 0,
             bytes: 0,
@@ -638,6 +788,7 @@ impl Stats {
             latency_max_us: 0,
             last_seq: None,
             missing: 0,
+            keyframes: 0,
         }
     }
 
@@ -647,6 +798,7 @@ impl Stats {
         self.bytes += len as u64;
         self.latency_sum_us += latency;
         self.latency_max_us = self.latency_max_us.max(latency);
+        self.keyframes += u64::from(header.keyframe);
         if let Some(last) = self.last_seq {
             self.missing += header.seq.saturating_sub(last + 1);
         }
@@ -663,8 +815,12 @@ impl Stats {
         } else {
             0.0
         };
+        let keyframes = match self.codec {
+            Codec::H264 => format!("  keyframes {}", self.keyframes),
+            Codec::Mjpeg => String::new(),
+        };
         info!(
-            "{:>5.1} fps  {:>6.1} Mbit/s  latency avg {:>6.1} ms max {:>6.1} ms  rtt {:>5.1} ms  missing {} (stale {})  sink dropped {}",
+            "{:>5.1} fps  {:>6.2} Mbit/s  latency avg {:>6.1} ms max {:>6.1} ms  rtt {:>5.1} ms  missing {} (stale {})  sink dropped {}{keyframes}",
             self.frames as f64 / secs,
             self.bytes as f64 * 8.0 / 1e6 / secs,
             avg_ms,
@@ -676,7 +832,7 @@ impl Stats {
         );
         *self = Stats {
             last_seq: self.last_seq,
-            ..Stats::new()
+            ..Stats::new(self.codec)
         };
     }
 }

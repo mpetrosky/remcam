@@ -1,4 +1,4 @@
-//! remcam wire protocol, v1.
+//! remcam wire protocol, v2.
 //!
 //! One QUIC connection per client. The client opens a single bidirectional
 //! *control* stream and exchanges [`ClientMsg`] / [`ServerMsg`] on it. Each
@@ -6,6 +6,12 @@
 //! a length-prefixed [`FrameHeader`] followed by the raw payload until the
 //! stream ends. A lost packet therefore only delays its own frame, and a
 //! stale frame can be abandoned without affecting newer ones.
+//!
+//! The server opens frame streams in sequence order. MJPEG frames are
+//! independent, so the client may skip any of them. H.264 frames depend on
+//! earlier ones and must be decoded in stream order; if the client has to
+//! skip one, it sends [`ClientMsg::RequestKeyframe`] and waits for a frame
+//! with [`FrameHeader::keyframe`] set.
 
 pub mod tls;
 
@@ -14,8 +20,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// QUIC ALPN identifier; bumped on incompatible wire changes.
-pub const ALPN: &[u8] = b"remcam/1";
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const ALPN: &[u8] = b"remcam/2";
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_PORT: u16 = 7450;
 /// DNS-SD service type servers advertise on the LAN. TXT records: `v` (protocol
 /// version) and `fp` (certificate fingerprint).
@@ -39,6 +45,35 @@ impl std::fmt::Display for FourCC {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&String::from_utf8_lossy(&self.0))
     }
+}
+
+/// How frames are encoded on the wire.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    /// The camera's own JPEG frames, passed through untouched. Lowest
+    /// latency and server CPU, but 20–60 Mbit/s: wired LAN or good Wi-Fi.
+    Mjpeg,
+    /// Re-encoded by the server at a bitrate that adapts to the link.
+    H264,
+}
+
+impl std::fmt::Display for Codec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Codec::Mjpeg => "MJPEG",
+            Codec::H264 => "H.264",
+        })
+    }
+}
+
+/// What the client wants on the wire, as opposed to what the camera delivers
+/// ([`VideoFormat`]).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamOptions {
+    pub codec: Codec,
+    /// Upper bound for the adaptive bitrate, in bits per second (H.264 only).
+    /// `None` lets the server choose from the frame size and rate.
+    pub max_bitrate: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -204,11 +239,13 @@ pub enum ClientMsg {
         version: u32,
         client_name: String,
     },
-    /// Start streaming `device_id` in (approximately) `format`. The server
-    /// replies with [`ServerMsg::Opened`] carrying the format actually set.
+    /// Start streaming `device_id`, captured in (approximately) `format`
+    /// and sent as `stream.codec`. The server replies with
+    /// [`ServerMsg::Opened`] carrying the format actually set.
     Open {
         device_id: String,
         format: VideoFormat,
+        stream: StreamOptions,
     },
     /// Set a control on the open device. The server answers with
     /// [`ServerMsg::Controls`] on success, [`ServerMsg::Error`] otherwise.
@@ -216,6 +253,9 @@ pub enum ClientMsg {
         id: u32,
         value: i64,
     },
+    /// Ask for the next H.264 frame to be a keyframe, after the client had
+    /// to skip a frame. Ignored for MJPEG.
+    RequestKeyframe,
     Close,
 }
 
@@ -224,6 +264,8 @@ pub enum ServerMsg {
     Hello {
         version: u32,
         server_name: String,
+        /// Codecs the server can send.
+        codecs: Vec<Codec>,
     },
     DeviceList {
         devices: Vec<DeviceInfo>,
@@ -231,6 +273,7 @@ pub enum ServerMsg {
     Opened {
         epoch: u32,
         format: VideoFormat,
+        stream: StreamOptions,
     },
     /// Current state of every control on the open device. Sent after
     /// `Opened` and after each `SetControl`, since changing one control
@@ -252,6 +295,8 @@ pub struct FrameHeader {
     /// Capture time in microseconds since the Unix epoch, on the server's clock.
     pub capture_ts_us: u64,
     pub len: u32,
+    /// The frame decodes on its own (always true for MJPEG).
+    pub keyframe: bool,
 }
 
 /// Write `msg` as a big-endian u32 length followed by its postcard encoding.
@@ -297,11 +342,19 @@ mod tests {
                 height: 720,
                 fps: 30,
             },
+            stream: StreamOptions {
+                codec: Codec::H264,
+                max_bitrate: Some(2_000_000),
+            },
         };
         let mut buf = Vec::new();
         write_msg(&mut buf, &msg).await.unwrap();
         let back: ClientMsg = read_msg(&mut buf.as_slice()).await.unwrap();
-        assert!(matches!(back, ClientMsg::Open { format, .. } if format.width == 1280));
+        assert!(matches!(
+            back,
+            ClientMsg::Open { format, stream, .. }
+                if format.width == 1280 && stream.codec == Codec::H264
+        ));
     }
 
     #[test]
