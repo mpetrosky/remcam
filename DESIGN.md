@@ -47,7 +47,8 @@ camera already compresses for us.
 
 QUIC fits both phases without a later rewrite:
 
-- **TLS 1.3 built in**, so it's WAN-ready from day one.
+- **TLS 1.3 built in**, so it's WAN-ready from day one. Both ends present
+  self-signed certificates and are authenticated by fingerprint (section 4).
 - **One unidirectional stream per frame.** A lost packet only stalls its own
   frame. If a frame is too old (newer one already done), the receiver
   `stop_sending`s it and the sender `reset`s it. That's a simple "drop stale
@@ -116,7 +117,103 @@ Discovery: servers advertise `_remcam._udp.local.` with TXT `v` (protocol
 version) and `fp` (certificate fingerprint). Loopback addresses aren't
 advertised.
 
-## 4. Crates
+## 4. Security
+
+QUIC already encrypts and authenticates everything with TLS 1.3, so remcam
+needs no tunnel of its own. What it needs is to decide *who* is allowed in.
+
+### Why not SSH or TLS tunnels
+
+- **SSH port forwarding** (`ssh -L`) carries TCP only, and remcam is UDP.
+  Forcing it into TCP brings back head-of-line blocking, and SSH's buffering
+  hides congestion from the bitrate controller, so latency grows to seconds
+  (exactly what M4's acknowledgement-based in-flight limit fixed). The video
+  would also be encrypted twice.
+- **TLS tunnels** (stunnel and similar): the same TCP problems, and they add
+  nothing that QUIC's TLS 1.3 doesn't already give.
+- **WireGuard / Tailscale** carry UDP and work well underneath remcam. They
+  are the recommended way across the internet today (no remcam code needed),
+  but not a replacement for remcam's own authentication: everyone else on
+  the VPN or tailnet can reach the server too.
+
+### Identities and trust files
+
+Each side has a self-signed certificate (`rcgen`), created on first run in
+`~/.config/remcam` (`$XDG_CONFIG_HOME/remcam`), and is identified by its
+SHA-256 fingerprint, the same trust model as SSH keys.
+
+| File | Side | Contents |
+|---|---|---|
+| `cert.der`, `key.der` | server | server identity (key mode 0600) |
+| `client/cert.der`, `client/key.der` | client | client identity (key mode 0600) |
+| `authorized_clients` | server | one line per client: fingerprint and a name, like `authorized_keys` |
+| `known_servers` | client | one line per server: name and fingerprint, like `known_hosts` |
+
+The client and server identities are kept apart so both can run as the same
+user on one machine. The text files allow `#` comments and are re-read on
+each connection, so removing a line locks a client out of new connections
+without a restart.
+
+### Handshake rules
+
+- **Client → server (mutual TLS):** the client always presents its
+  certificate. The server's TLS verifier accepts any validly signed
+  certificate and the application checks its fingerprint against
+  `authorized_clients` right after `Hello`. An unknown client may only
+  pair; anything else gets `Error { unauthorized }` and the connection is
+  closed, before any camera is listed or opened. Rejections are logged with
+  the client's fingerprint and address.
+- **Server → client:** the server certificate is accepted if it matches
+  `--fingerprint`, or the entry for that host in `known_servers`. A server
+  whose fingerprint changed is a hard error naming the file and line, like
+  SSH. `--fingerprint` with a host not yet in `known_servers` adds it, so
+  the fingerprint is needed only once. A server found through mDNS is
+  trusted only if its advertised fingerprint is already in `known_servers`
+  (mDNS itself is unauthenticated).
+- **0-RTT stays disabled:** early data can be replayed.
+
+### Pairing with a short code
+
+Copying fingerprints both ways is error-prone, so pairing exchanges them
+with a one-time code instead:
+
+```sh
+remcam-server pair            # on the camera host, while the server runs:
+                              # prints a code like  K7QM-4XRT  (valid 5 min)
+remcam-client <host> --pair K7QM-4XRT [--name laptop]
+```
+
+1. `remcam-server pair` asks the running server (over a local Unix socket
+   in the config directory) to create a code: 8 Crockford base32
+   characters (40 bits), single use, expiring after 5 minutes.
+2. The client connects without verifying the server's certificate yet and
+   sends `Pair`. Both sides run SPAKE2 with the code as the password. The
+   code never crosses the network, and each guess needs a live exchange
+   with the server, so it can't be brute-forced offline.
+3. Each side sends a confirmation MAC, keyed with the SPAKE2 secret, over
+   the TLS exporter value (RFC 5705/8446, unique to this TLS session) and
+   both certificate fingerprints. A machine in the middle runs two separate
+   TLS sessions and can't produce matching MACs without the code.
+4. On success, the server appends the client's fingerprint and name to
+   `authorized_clients` and the client adds the server to `known_servers`.
+   After 3 failed attempts the code is cancelled.
+
+Unauthenticated connections are limited per source address, so pairing
+attempts and handshakes can't be used to tie up the server.
+
+### Reaching a server across the internet
+
+In order of effort:
+
+1. **Tailscale or WireGuard:** works now; remcam sees an ordinary address.
+2. **A forwarded UDP port** on the camera host's router: safe once client
+   authentication is in place, since only paired clients get past `Hello`.
+3. **`iroh` (M6):** hole punching with a relay fallback, no router setup.
+   Its relays only see encrypted QUIC. iroh identifies peers by Ed25519
+   keys, which would replace the certificate fingerprints, so the trust
+   files and pairing above carry over with a different key type.
+
+## 5. Crates
 
 | Purpose | Crate |
 |---|---|
@@ -127,9 +224,10 @@ advertised.
 | LAN discovery | `mdns-sd` |
 | JPEG decode | `zune-jpeg` or `turbojpeg` |
 | H.264 (Phase 2) | `openh264` (software), or VAAPI through `ffmpeg-next` / GStreamer (`gstreamer` crate) |
+| Pairing (PAKE) | `spake2` |
 | WAN NAT traversal (Phase 3) | `iroh` (QUIC + hole punching + relay fallback) |
 
-## 5. Roadmap
+## 6. Roadmap
 
 0. **Validate the path without Rust** (needs `v4l2loopback`):
    ```sh
@@ -162,15 +260,22 @@ advertised.
    loss, or RTT doubling (×0.85); ×1.08 per second increase after a 3 s
    hold. The client decodes in order and requests a keyframe if it ever has
    to skip a frame. MJPEG passthrough remains as `--codec mjpeg`.
-5. **M5 (WAN):** auth with an SSH-style trust-on-first-use cert fingerprint or
-   a pairing code, NAT traversal (`iroh`, or "use Tailscale/WireGuard" as the
-   zero-effort answer), and a relay fallback.
+5. **M5 (authentication):** client certificates checked against
+   `authorized_clients`, a `known_servers` file on the client, pairing with
+   a one-time code (SPAKE2 bound to the TLS session), and per-address limits
+   on unauthenticated connections (section 4). Protocol v3. Internet access
+   is documented through Tailscale/WireGuard or a forwarded port.
+6. **M6 (NAT traversal):** `iroh` for direct connections through NAT with a
+   relay fallback, so no VPN or router setup is needed.
 
-## 6. Open questions
+## 7. Open questions
 
-- **Trusting discovered servers:** mDNS advertises the fingerprint, but it's
-  unauthenticated, so the client still requires `--fingerprint`. Fix in M5
-  with trust-on-first-use (a `known_hosts`-style file) or a pairing code.
+- **Pairing over SSH:** with SSH access to the camera host, a
+  `--pair-ssh user@host` option could exchange fingerprints over SSH instead
+  of a code (SSH does the authentication; video still goes over QUIC).
+- **Per-client permissions:** every authorized client can currently open
+  any camera and change controls. A view-only flag in `authorized_clients`
+  may be useful once several people share a camera.
 - **Placeholder while disconnected:** apps currently see the last frame
   frozen during a reconnect. A "reconnecting" card (or v4l2loopback's
   `timeout_image`) would be clearer.
@@ -195,9 +300,9 @@ advertised.
 - **Audio:** many webcams include a mic. It could be forwarded on the same
   connection as Opus, or left to PipeWire's existing RTP module.
 - **Windows/macOS receivers:** the protocol is portable, but the sink isn't.
-  See section 7.
+  See section 8.
 
-## 7. Platform notes (not a current goal)
+## 8. Platform notes (not a current goal)
 
 ### Virtual camera sink
 
