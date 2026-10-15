@@ -388,16 +388,18 @@ fn target_from(server: discover::Server) -> anyhow::Result<Target> {
 
 /// How a discovered server relates to known_servers, for `--discover`.
 fn trust_status(known: &KnownServers, server: &discover::Server) -> String {
-    let advertised = server.fingerprint.as_deref().unwrap_or_default();
-    match known.lookup(&server.name) {
-        Some(e) if e.fingerprint == advertised => "known".into(),
-        Some(e) => format!(
+    let advertised = server.fingerprint.as_deref();
+    match (known.lookup(&server.name), advertised) {
+        // Without an advertised fingerprint there's nothing to compare.
+        (Some(_), None) => "known (no fingerprint advertised)".into(),
+        (Some(e), Some(fp)) if e.fingerprint == fp => "known".into(),
+        (Some(e), Some(_)) => format!(
             "known, but {}:{} has a different fingerprint",
             known.path().display(),
             e.line
         ),
-        None if known.contains_fingerprint(advertised) => "known under another name".into(),
-        None => "not paired".into(),
+        (None, Some(fp)) if known.contains_fingerprint(fp) => "known under another name".into(),
+        (None, _) => "not paired".into(),
     }
 }
 
