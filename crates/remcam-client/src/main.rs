@@ -245,7 +245,8 @@ async fn main() -> anyhow::Result<()> {
     // Separate from the server's identity, so both can run as one user.
     let identity = tls::load_or_create_identity(&config_dir.join("client"))?;
     let client_fp = identity.fingerprint();
-    let client_name = args.name.clone().unwrap_or_else(hostname);
+    // Sanitized as the server stores it, so both sides show the same name.
+    let client_name = trust::sanitize_name(&args.name.clone().unwrap_or_else(hostname));
 
     let bind: SocketAddr = if target.addr.is_ipv4() {
         "0.0.0.0:0"
