@@ -98,7 +98,8 @@ pair again to replace it. `--insecure` skips checking the server, but the
 server still checks the client.
 
 The server limits connections from one address to 30 a minute, and
-connections that haven't said who they are yet to 32 at a time.
+connections that haven't said who they are yet to 32 at a time. While 4096
+addresses have connected within the last minute, new addresses are refused.
 
 ### Across the internet
 

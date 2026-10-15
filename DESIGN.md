@@ -223,7 +223,9 @@ remcam-client <host> --pair K7QM-4XRT [--name laptop]
 
 Limits: 30 new connections per source address per minute and 32
 connections at a time that haven't yet been authorized (`Incoming::refuse`
-beyond that), and 10 s to send `Hello` or `Pair`.
+beyond that), and 10 s to send `Hello` or `Pair`. At most 4096 source
+addresses are tracked; while that many are active within a minute, new
+addresses are refused until the once-a-minute sweep frees room.
 
 ### Reaching a server across the internet
 
