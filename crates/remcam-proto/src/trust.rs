@@ -9,7 +9,7 @@
 //! bad edit doesn't lock everyone out.
 
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -65,6 +65,11 @@ fn read_entries(path: &Path, fp_first: bool) -> anyhow::Result<Vec<Entry>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
+    Ok(parse_entries(path, &text, fp_first))
+}
+
+/// Parse the contents of `path`; see [`read_entries`].
+fn parse_entries(path: &Path, text: &str, fp_first: bool) -> Vec<Entry> {
     let mut entries = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let line_no = i + 1;
@@ -90,7 +95,7 @@ fn read_entries(path: &Path, fp_first: bool) -> anyhow::Result<Vec<Entry>> {
             Err(e) => warn!("{}:{line_no}: {e:#}, skipping", path.display()),
         }
     }
-    Ok(entries)
+    entries
 }
 
 /// Append one line, creating the file (owner-only) with `header` if needed.
@@ -99,14 +104,25 @@ fn append_line(path: &Path, header: &str, line: &str) -> anyhow::Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let mut f = std::fs::OpenOptions::new()
+        .read(true)
         .append(true)
         .create(true)
         .mode(0o600)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
     let mut text = String::new();
-    if f.metadata()?.len() == 0 {
+    let len = f.metadata()?.len();
+    if len == 0 {
         text += header;
+    } else {
+        // A hand-edited file may lack the final newline; without one the
+        // new entry would join the last line.
+        let mut last = [0u8];
+        f.read_exact_at(&mut last, len - 1)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if last[0] != b'\n' {
+            text.push('\n');
+        }
     }
     text += line;
     text.push('\n');
@@ -204,6 +220,9 @@ impl KnownServers {
     /// Remember `name` as `fingerprint`. Does nothing if that's already
     /// known; a different fingerprint for the same name is an error.
     pub fn add(&mut self, name: &str, fingerprint: &str) -> anyhow::Result<()> {
+        // Another client process or a hand edit may have changed the file
+        // since it was loaded.
+        self.entries = read_entries(&self.path, false)?;
         if let Some(e) = self.lookup(name) {
             if e.fingerprint == fingerprint {
                 return Ok(());
@@ -225,24 +244,31 @@ impl KnownServers {
         Ok(())
     }
 
-    /// Remember `name` as `fingerprint`, dropping any other fingerprint
+    /// Remember `name` as `fingerprint`, dropping every other fingerprint
     /// stored for it. Only for identities proven by pairing.
     pub fn replace(&mut self, name: &str, fingerprint: &str) -> anyhow::Result<()> {
-        if let Some(old) = self.lookup(name).cloned() {
-            if old.fingerprint == fingerprint {
-                return Ok(());
-            }
-            let text = std::fs::read_to_string(&self.path)
-                .with_context(|| format!("reading {}", self.path.display()))?;
+        // Work from the file as it is now, not as it was loaded: lines may
+        // have moved since.
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", self.path.display())),
+        };
+        let key = Self::key(name);
+        let stale: Vec<usize> = parse_entries(&self.path, &text, false)
+            .into_iter()
+            .filter(|e| e.name.to_ascii_lowercase() == key && e.fingerprint != fingerprint)
+            .map(|e| e.line)
+            .collect();
+        if !stale.is_empty() {
             let kept: String = text
                 .lines()
                 .enumerate()
-                .filter(|(i, _)| *i + 1 != old.line)
+                .filter(|(i, _)| !stale.contains(&(i + 1)))
                 .map(|(_, l)| format!("{l}\n"))
                 .collect();
             std::fs::write(&self.path, kept)
                 .with_context(|| format!("writing {}", self.path.display()))?;
-            self.entries = read_entries(&self.path, false)?;
         }
         self.add(name, fingerprint)
     }
@@ -315,6 +341,51 @@ mod tests {
         let known = KnownServers::load(&dir).unwrap();
         assert_eq!(known.lookup("camhost").unwrap().fingerprint, FP_B);
         assert_eq!(known.lookup("192.168.1.5:7450").unwrap().fingerprint, FP_A);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn append_after_missing_newline() {
+        let dir = temp_dir("newline");
+        let clients = AuthorizedClients::new(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(clients.path(), format!("{FP_A} phone")).unwrap();
+        clients.add(FP_B, "laptop").unwrap();
+        assert_eq!(clients.lookup(FP_A).unwrap().as_deref(), Some("phone"));
+        assert_eq!(clients.lookup(FP_B).unwrap().as_deref(), Some("laptop"));
+
+        let path = dir.join(KNOWN_SERVERS);
+        std::fs::write(&path, format!("camhost {FP_A}")).unwrap();
+        let mut known = KnownServers::load(&dir).unwrap();
+        known.add("other", FP_B).unwrap();
+        let known = KnownServers::load(&dir).unwrap();
+        assert_eq!(known.lookup("camhost").unwrap().fingerprint, FP_A);
+        assert_eq!(known.lookup("other").unwrap().fingerprint, FP_B);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_after_file_changed() {
+        let dir = temp_dir("replace");
+        let mut known = KnownServers::load(&dir).unwrap();
+        known.add("camhost", FP_A).unwrap();
+        known.add("other", FP_B).unwrap();
+
+        // Another process inserts lines above, after `known` was loaded,
+        // including a duplicate entry for camhost.
+        let text = std::fs::read_to_string(known.path()).unwrap();
+        std::fs::write(known.path(), format!("# moved\nCAMHOST {FP_A}\n{text}")).unwrap();
+
+        known.replace("camhost", FP_B).unwrap();
+        let known = KnownServers::load(&dir).unwrap();
+        assert_eq!(known.lookup("camhost").unwrap().fingerprint, FP_B);
+        assert_eq!(known.lookup("other").unwrap().fingerprint, FP_B);
+        let camhost_lines = std::fs::read_to_string(known.path())
+            .unwrap()
+            .lines()
+            .filter(|l| l.to_ascii_lowercase().starts_with("camhost"))
+            .count();
+        assert_eq!(camhost_lines, 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
