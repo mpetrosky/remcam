@@ -75,15 +75,16 @@ is the leanest Rust option).
 - Later: a PipeWire video source node (`pipewire` crate) for portal-based
   apps (Flatpak browsers), with no kernel module needed.
 
-## 3. Wire protocol (v2)
+## 3. Wire protocol (v3)
 
-ALPN `remcam/2`. Messages are `serde` + `postcard` with a u32 length prefix.
+ALPN `remcam/3`. Messages are `serde` + `postcard` with a u32 length prefix.
 The authoritative definitions are in `crates/remcam-proto/src/lib.rs`.
 
 Control stream (client ↔ server):
 ```
 → Hello        { version, client_name }
 ← Hello        { version, server_name, codecs }
+   or Unauthorized { fingerprint }        // client not in authorized_clients; closes
 ← DeviceList   { devices: [ {id, name,
                              formats: [{fourcc, sizes: [{w, h, fps[]}]}],
                              controls: [{id, name, kind, default, state, read_only}]} ] }
@@ -95,6 +96,13 @@ Control stream (client ↔ server):
 → RequestKeyframe                          // H.264: client had to skip a frame
 → Close
 ← Error        { msg }
+```
+Instead of `Hello`, a client can pair (section 4):
+```
+→ Pair         { version, client_name, spake }
+← Pair         { server_name, spake }
+→ PairConfirm  { mac }
+← PairConfirm  { mac }                    // or Error { "wrong pairing code" }
 ```
 `format` is what the camera captures (always MJPEG for now); `stream.codec`
 is what goes on the wire. The bitrate is adapted by the server alone, so no
@@ -150,9 +158,11 @@ SHA-256 fingerprint, the same trust model as SSH keys.
 | `known_servers` | client | one line per server: name and fingerprint, like `known_hosts` |
 
 The client and server identities are kept apart so both can run as the same
-user on one machine. The text files allow `#` comments and are re-read on
-each connection, so removing a line locks a client out of new connections
-without a restart.
+user on one machine. The text files allow `#` comments; malformed lines are
+skipped with a warning. `authorized_clients` is re-read on each connection,
+so removing a line locks a client out of new connections without a restart.
+Client names come from the client, so the server reduces them to
+`[A-Za-z0-9._:[]-]` before logging or saving them.
 
 ### Handshake rules
 
@@ -167,9 +177,14 @@ without a restart.
   `--fingerprint`, or the entry for that host in `known_servers`. A server
   whose fingerprint changed is a hard error naming the file and line, like
   SSH. `--fingerprint` with a host not yet in `known_servers` adds it, so
-  the fingerprint is needed only once. A server found through mDNS is
-  trusted only if its advertised fingerprint is already in `known_servers`
-  (mDNS itself is unauthenticated).
+  the fingerprint is needed only once. A name not in `known_servers`
+  accepts any fingerprint that is in it under another name (the same
+  server reached by address, hostname or mDNS name) and is then saved as an
+  alias; with no known servers at all, the client refuses before
+  connecting. mDNS-advertised fingerprints are only shown, never trusted.
+- Rejections the client can't fix by retrying (unknown client, changed
+  server certificate, protocol mismatch) end the client even after it has
+  streamed, instead of reconnecting forever.
 - **0-RTT stays disabled:** early data can be replayed.
 
 ### Pairing with a short code
@@ -183,9 +198,12 @@ remcam-server pair            # on the camera host, while the server runs:
 remcam-client <host> --pair K7QM-4XRT [--name laptop]
 ```
 
-1. `remcam-server pair` asks the running server (over a local Unix socket
-   in the config directory) to create a code: 8 Crockford base32
-   characters (40 bits), single use, expiring after 5 minutes.
+1. `remcam-server pair` asks the running server to create a code: 8
+   Crockford base32 characters (40 bits), single use, expiring after 5
+   minutes or when the command is interrupted. The command and the server
+   talk over a Unix socket in `$XDG_RUNTIME_DIR` (named after the config
+   directory; the config directory itself if that isn't set), and each
+   side checks that the other runs as the same user.
 2. The client connects without verifying the server's certificate yet and
    sends `Pair`. Both sides run SPAKE2 with the code as the password. The
    code never crosses the network, and each guess needs a live exchange
@@ -195,11 +213,14 @@ remcam-client <host> --pair K7QM-4XRT [--name laptop]
    both certificate fingerprints. A machine in the middle runs two separate
    TLS sessions and can't produce matching MACs without the code.
 4. On success, the server appends the client's fingerprint and name to
-   `authorized_clients` and the client adds the server to `known_servers`.
-   After 3 failed attempts the code is cancelled.
+   `authorized_clients` and the client adds the server to `known_servers`
+   (replacing an older fingerprint for that name). After 3 failed attempts
+   the code is cancelled; an attempt abandoned halfway counts as failed.
+   Only one attempt runs at a time.
 
-Unauthenticated connections are limited per source address, so pairing
-attempts and handshakes can't be used to tie up the server.
+Limits: 30 new connections per source address per minute and 32
+connections at a time that haven't yet been authorized (`Incoming::refuse`
+beyond that), and 10 s to send `Hello` or `Pair`.
 
 ### Reaching a server across the internet
 
@@ -260,10 +281,10 @@ In order of effort:
    loss, or RTT doubling (×0.85); ×1.08 per second increase after a 3 s
    hold. The client decodes in order and requests a keyframe if it ever has
    to skip a frame. MJPEG passthrough remains as `--codec mjpeg`.
-5. **M5 (authentication):** client certificates checked against
+5. **M5 (done):** client certificates checked against
    `authorized_clients`, a `known_servers` file on the client, pairing with
-   a one-time code (SPAKE2 bound to the TLS session), and per-address limits
-   on unauthenticated connections (section 4). Protocol v3. Internet access
+   a one-time code (SPAKE2 bound to the TLS session), and limits on
+   unauthenticated connections (section 4). Protocol v3. Internet access
    is documented through Tailscale/WireGuard or a forwarded port.
 6. **M6 (NAT traversal):** `iroh` for direct connections through NAT with a
    relay fallback, so no VPN or router setup is needed.

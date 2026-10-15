@@ -1,7 +1,11 @@
-//! remcam wire protocol, v2.
+//! remcam wire protocol, v3.
 //!
-//! One QUIC connection per client. The client opens a single bidirectional
-//! *control* stream and exchanges [`ClientMsg`] / [`ServerMsg`] on it. Each
+//! One QUIC connection per client. Both sides present certificates (see
+//! [`tls`]). The client opens a single bidirectional *control* stream and
+//! exchanges [`ClientMsg`] / [`ServerMsg`] on it, starting with either
+//! [`ClientMsg::Hello`] or, to pair, [`ClientMsg::Pair`] (see [`pairing`]).
+//! A client whose certificate isn't in the server's `authorized_clients`
+//! gets [`ServerMsg::Unauthorized`] in reply to `Hello`. Each
 //! video frame travels on its own server-opened unidirectional stream:
 //! a length-prefixed [`FrameHeader`] followed by the raw payload until the
 //! stream ends. A lost packet therefore only delays its own frame, and a
@@ -13,15 +17,17 @@
 //! skip one, it sends [`ClientMsg::RequestKeyframe`] and waits for a frame
 //! with [`FrameHeader::keyframe`] set.
 
+pub mod pairing;
 pub mod tls;
+pub mod trust;
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// QUIC ALPN identifier; bumped on incompatible wire changes.
-pub const ALPN: &[u8] = b"remcam/2";
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const ALPN: &[u8] = b"remcam/3";
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const DEFAULT_PORT: u16 = 7450;
 /// DNS-SD service type servers advertise on the LAN. TXT records: `v` (protocol
 /// version) and `fp` (certificate fingerprint).
@@ -239,6 +245,17 @@ pub enum ClientMsg {
         version: u32,
         client_name: String,
     },
+    /// Instead of `Hello`: pair using the code the server is showing.
+    /// `spake` is the client's SPAKE2 message.
+    Pair {
+        version: u32,
+        client_name: String,
+        spake: Vec<u8>,
+    },
+    /// Proof that the client used the same code on this connection.
+    PairConfirm {
+        mac: Vec<u8>,
+    },
     /// Start streaming `device_id`, captured in (approximately) `format`
     /// and sent as `stream.codec`. The server replies with
     /// [`ServerMsg::Opened`] carrying the format actually set.
@@ -266,6 +283,22 @@ pub enum ServerMsg {
         server_name: String,
         /// Codecs the server can send.
         codecs: Vec<Codec>,
+    },
+    /// Reply to `Hello` from a client not in `authorized_clients`; the
+    /// server closes the connection after sending it.
+    Unauthorized {
+        /// The client's certificate fingerprint, as the server saw it.
+        fingerprint: String,
+    },
+    /// Reply to `Pair`: the server's SPAKE2 message.
+    Pair {
+        server_name: String,
+        spake: Vec<u8>,
+    },
+    /// The server's proof; once the client has checked it, both sides trust
+    /// each other.
+    PairConfirm {
+        mac: Vec<u8>,
     },
     DeviceList {
         devices: Vec<DeviceInfo>,

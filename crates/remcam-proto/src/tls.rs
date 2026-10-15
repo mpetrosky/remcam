@@ -1,9 +1,12 @@
 //! QUIC/TLS setup.
 //!
-//! The server uses a self-signed certificate that is generated once and kept
-//! in its config directory. Clients authenticate it by SHA-256 fingerprint
-//! (printed by the server at startup) rather than through a CA, the same
-//! trust model as SSH host keys.
+//! Server and client each use a self-signed certificate that is generated
+//! once and kept in the config directory. Each side identifies the other by
+//! the SHA-256 fingerprint of its certificate rather than through a CA, the
+//! same trust model as SSH keys. TLS only checks that the peer holds the key
+//! for the certificate it presents; whether that fingerprint is welcome is
+//! decided by the client's [`ServerTrust`] and, on the server, by the
+//! application after the handshake (see `trust`).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,7 +17,8 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use sha2::{Digest, Sha256};
 
 use crate::{ALPN, SERVER_NAME};
@@ -28,21 +32,47 @@ pub fn fingerprint(cert: &CertificateDer<'_>) -> String {
     hex::encode(Sha256::digest(cert.as_ref()))
 }
 
-/// Load the server identity from `dir`, generating and saving it on first use.
-pub fn load_or_create_identity(
-    dir: &Path,
-) -> anyhow::Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+/// The certificate this side presents, and its private key.
+pub struct Identity {
+    pub cert: CertificateDer<'static>,
+    pub key: PrivateKeyDer<'static>,
+}
+
+impl Identity {
+    pub fn fingerprint(&self) -> String {
+        fingerprint(&self.cert)
+    }
+}
+
+/// Fingerprint of the certificate the peer presented on `conn`.
+pub fn peer_fingerprint(conn: &quinn::Connection) -> Option<String> {
+    let certs = conn
+        .peer_identity()?
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .ok()?;
+    certs.first().map(fingerprint)
+}
+
+/// Load the identity (`cert.der`, `key.der`) from `dir`, generating and
+/// saving it on first use.
+pub fn load_or_create_identity(dir: &Path) -> anyhow::Result<Identity> {
     let cert_path = dir.join("cert.der");
     let key_path = dir.join("key.der");
-    if cert_path.exists() && key_path.exists() {
+    if cert_path.exists() != key_path.exists() {
+        bail!(
+            "{} has only one of cert.der and key.der; remove it to start over",
+            dir.display()
+        );
+    }
+    if cert_path.exists() {
         let cert = std::fs::read(&cert_path)
             .with_context(|| format!("reading {}", cert_path.display()))?;
         let key =
             std::fs::read(&key_path).with_context(|| format!("reading {}", key_path.display()))?;
-        return Ok((
-            CertificateDer::from(cert),
-            PrivatePkcs8KeyDer::from(key).into(),
-        ));
+        return Ok(Identity {
+            cert: CertificateDer::from(cert),
+            key: PrivatePkcs8KeyDer::from(key).into(),
+        });
     }
 
     let generated = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])?;
@@ -50,9 +80,15 @@ pub fn load_or_create_identity(
     let key = generated.signing_key.serialize_der();
 
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    std::fs::write(&cert_path, cert.as_ref())?;
+    // Key first: if writing the certificate fails, the next run reports the
+    // half-written identity instead of silently replacing it.
     write_private(&key_path, &key)?;
-    Ok((cert, PrivatePkcs8KeyDer::from(key).into()))
+    std::fs::write(&cert_path, cert.as_ref())
+        .with_context(|| format!("writing {}", cert_path.display()))?;
+    Ok(Identity {
+        cert,
+        key: PrivatePkcs8KeyDer::from(key).into(),
+    })
 }
 
 fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
@@ -68,14 +104,16 @@ fn write_private(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn server_config(
-    cert: CertificateDer<'static>,
-    key: PrivateKeyDer<'static>,
-) -> anyhow::Result<quinn::ServerConfig> {
-    let mut tls = rustls::ServerConfig::builder_with_provider(provider())
+/// Server side. Every client must present a certificate; which ones are
+/// allowed in is checked after the handshake against `authorized_clients`.
+/// 0-RTT stays disabled (rustls' default `max_early_data_size` of 0), since
+/// early data can be replayed.
+pub fn server_config(identity: Identity) -> anyhow::Result<quinn::ServerConfig> {
+    let provider = provider();
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)?;
+        .with_client_cert_verifier(Arc::new(AnyClientCert { provider }))
+        .with_single_cert(vec![identity.cert], identity.key)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
@@ -88,31 +126,39 @@ pub fn server_config(
 /// How the client decides whether to trust the server's certificate.
 #[derive(Debug, Clone)]
 pub enum ServerTrust {
-    /// Accept only a certificate with this SHA-256 fingerprint (hex).
-    Fingerprint(String),
-    /// Accept any certificate. Traffic is still encrypted, but not authenticated.
-    Insecure,
+    /// Accept only a certificate with one of these SHA-256 fingerprints.
+    Fingerprints(Vec<String>),
+    /// Accept any certificate. Traffic is still encrypted, but the server is
+    /// not authenticated. Used for pairing, which authenticates the server
+    /// itself once the connection is up.
+    Any,
 }
 
-pub fn client_config(trust: ServerTrust) -> anyhow::Result<quinn::ClientConfig> {
-    if let ServerTrust::Fingerprint(fp) = &trust
-        && (fp.len() != 64 || !fp.bytes().all(|b| b.is_ascii_hexdigit()))
-    {
-        bail!("fingerprint must be 64 hex characters");
+/// Normalize a fingerprint typed or pasted by a person: lowercase hex,
+/// `:` separators allowed.
+pub fn parse_fingerprint(fp: &str) -> anyhow::Result<String> {
+    let fp: String = fp.trim().chars().filter(|&c| c != ':').collect();
+    if fp.len() != 64 || !fp.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("a fingerprint is 64 hex characters, got {fp:?}");
     }
+    Ok(fp.to_ascii_lowercase())
+}
+
+/// Client side: present `identity`, and accept the server according to `trust`.
+pub fn client_config(
+    trust: ServerTrust,
+    identity: Identity,
+) -> anyhow::Result<quinn::ClientConfig> {
     let provider = provider();
     let verifier = Arc::new(FingerprintVerifier {
-        trust: match trust {
-            ServerTrust::Fingerprint(fp) => ServerTrust::Fingerprint(fp.to_ascii_lowercase()),
-            other => other,
-        },
+        trust,
         provider: provider.clone(),
     });
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+        .with_client_auth_cert(vec![identity.cert], identity.key)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
     let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
@@ -142,14 +188,14 @@ impl ServerCertVerifier for FingerprintVerifier {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
+        let fp = fingerprint(end_entity);
         match &self.trust {
-            ServerTrust::Insecure => Ok(ServerCertVerified::assertion()),
-            ServerTrust::Fingerprint(expected) if fingerprint(end_entity) == *expected => {
+            ServerTrust::Any => Ok(ServerCertVerified::assertion()),
+            ServerTrust::Fingerprints(known) if known.contains(&fp) => {
                 Ok(ServerCertVerified::assertion())
             }
-            ServerTrust::Fingerprint(_) => Err(rustls::Error::General(format!(
-                "server certificate fingerprint {} does not match",
-                fingerprint(end_entity)
+            ServerTrust::Fingerprints(_) => Err(rustls::Error::General(format!(
+                "server certificate fingerprint {fp} does not match"
             ))),
         }
     }
@@ -160,10 +206,7 @@ impl ServerCertVerifier for FingerprintVerifier {
         _cert: &CertificateDer<'_>,
         _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        // Only TLS 1.3 is enabled.
-        Err(rustls::Error::PeerIncompatible(
-            rustls::PeerIncompatible::Tls12NotOffered,
-        ))
+        tls12_not_offered()
     }
 
     fn verify_tls13_signature(
@@ -172,12 +215,7 @@ impl ServerCertVerifier for FingerprintVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        verify_tls13(&self.provider, message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -185,4 +223,71 @@ impl ServerCertVerifier for FingerprintVerifier {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+/// Accepts any client certificate, as long as the client proves it holds
+/// the matching key (TLS does that through the handshake signature).
+#[derive(Debug)]
+struct AnyClientCert {
+    provider: Arc<CryptoProvider>,
+}
+
+impl ClientCertVerifier for AnyClientCert {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        tls12_not_offered()
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13(&self.provider, message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn tls12_not_offered() -> Result<HandshakeSignatureValid, rustls::Error> {
+    // Only TLS 1.3 is enabled.
+    Err(rustls::Error::PeerIncompatible(
+        rustls::PeerIncompatible::Tls12NotOffered,
+    ))
+}
+
+fn verify_tls13(
+    provider: &CryptoProvider,
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+) -> Result<HandshakeSignatureValid, rustls::Error> {
+    rustls::crypto::verify_tls13_signature(
+        message,
+        cert,
+        dss,
+        &provider.signature_verification_algorithms,
+    )
 }

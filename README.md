@@ -3,19 +3,20 @@
 Share a USB webcam over the network. See [DESIGN.md](DESIGN.md) for the
 protocol and roadmap.
 
-Current state: **M4**. The server captures MJPEG from a V4L2 camera and sends
+Current state: **M5**. The server captures MJPEG from a V4L2 camera and sends
 it over QUIC, either as is or re-encoded to H.264 at a bitrate that adapts to
 the link. The client decodes it into a v4l2loopback device, where any app
 (OBS, browsers, Zoom, ffmpeg) sees it as a normal YUYV webcam. Servers are
 found on the LAN via mDNS, camera controls (exposure, focus, white balance,
 ...) can be set from the client, and the client reconnects by itself if the
-connection drops.
+connection drops. Server and client authenticate each other: a client must
+be paired with a server once, using a short one-time code.
 
 ## Workspace
 
 | Crate | Role |
 |---|---|
-| `remcam-proto` | Wire messages, framing, QUIC/TLS config (fingerprint-pinned self-signed certs) |
+| `remcam-proto` | Wire messages, framing, QUIC/TLS config (self-signed certs on both sides), trust files, pairing |
 | `remcam-codec` | JPEG decoding, YUV conversions, H.264 encode/decode (OpenH264) |
 | `remcam-server` | Runs on the machine with the camera |
 | `remcam-client` | Runs on the machine that wants the camera |
@@ -31,21 +32,23 @@ cargo build --release
 ./target/release/remcam-server --list          # cameras, sizes/frame rates, controls
 ./target/release/remcam-server                 # listens on udp/0.0.0.0:7450
 
+# Once per client: pair. On the camera host, while the server runs:
+./target/release/remcam-server pair            # shows a code like K7QM-4XRT
+# On the other machine:
+./target/release/remcam-client <host> --pair K7QM-4XRT
+
 # Other machine, once per boot (needs v4l2loopback-dkms):
 sudo modprobe v4l2loopback video_nr=10 card_label=remcam exclusive_caps=1
 
-./target/release/remcam-client --discover      # servers on the LAN, with fingerprints
-./target/release/remcam-client [<host>] --fingerprint <hex> --list
-./target/release/remcam-client [<host>] --fingerprint <hex> \
+./target/release/remcam-client --discover      # servers on the LAN, paired or not
+./target/release/remcam-client [<host>] --list
+./target/release/remcam-client [<host>] \
     --device /dev/video0 --size 1920x1080 --fps 30 \
     --sink /dev/video10 --ctrl exposure_dynamic_framerate=false
 ```
 
 `<host>` can be an address, a hostname, or the server's mDNS name. With no
-host, the client uses the only server on the LAN. A fingerprint is still
-required: mDNS is unauthenticated, so the client shows the advertised
-fingerprint but won't trust it on its own. Compare it with the server's
-startup output.
+host, the client uses the only server on the LAN.
 
 `--size` defaults to 1280x720 (or the largest size offered), and `--fps` to
 the highest rate at that size. Requests the camera doesn't offer are rejected
@@ -53,6 +56,61 @@ with the list of valid options. Other options: `--out DIR` saves frames
 (`DIR/<seq>.jpg` for MJPEG, `DIR/stream.h264` for H.264, playable with
 `ffplay`), `--frames N` stops after N frames, and `--stats SECS` sets the
 statistics interval (0 turns it off).
+
+### Pairing and trust
+
+Both sides have a self-signed certificate, made on first run and identified
+by its SHA-256 fingerprint, the same model as SSH keys. The connection is
+always encrypted (QUIC uses TLS 1.3), and each side checks the other's
+fingerprint:
+
+| File (in `~/.config/remcam`) | Machine | What it is |
+|---|---|---|
+| `cert.der`, `key.der` | server | the server's identity |
+| `client/cert.der`, `client/key.der` | client | the client's identity |
+| `authorized_clients` | server | clients allowed in: `<fingerprint> <name>` per line |
+| `known_servers` | client | servers trusted: `<name> <fingerprint>` per line |
+
+Pairing fills both lists in one step. `remcam-server pair` asks the running
+server for a code (single use, valid 5 minutes, cancelled after 3 wrong
+tries) and waits until a client uses it. The client proves it knows the
+code without sending it (SPAKE2), bound to that specific connection, so the
+code can't be guessed offline or relayed by a machine in the middle.
+
+Without pairing:
+
+- **Server identity:** pass `--fingerprint <hex>` once; it's saved in
+  `known_servers` when the connection works. A server already known under
+  one name (say its address) is accepted under another (its hostname or mDNS
+  name) and saved under that name too.
+- **Client identity:** a client the server doesn't know is turned away
+  before it can list or open a camera, with an error showing its
+  fingerprint. Adding that fingerprint to the server's `authorized_clients`
+  by hand works as well as pairing.
+
+`remcam-server clients` lists the authorized clients. Deleting a line from
+`authorized_clients` locks that client out from its next connection, with no
+restart needed. If a server's certificate changes (reinstalled, config
+deleted), the client refuses to connect and names the `known_servers` line;
+pair again to replace it. `--insecure` skips checking the server, but the
+server still checks the client.
+
+The server limits connections from one address to 30 a minute, and
+connections that haven't said who they are yet to 32 at a time.
+
+### Across the internet
+
+remcam's own authentication makes it safe to expose, so there are two easy
+options today:
+
+- **Tailscale or WireGuard** on both machines: connect to the server's VPN
+  address. Nothing to open on the router. This works well with remcam's
+  UDP traffic; tunnelling through SSH or a TLS proxy doesn't, since those
+  carry TCP and bring back the stalls and hidden congestion that QUIC avoids.
+- **Forward UDP port 7450** on the camera host's router to the server, and
+  connect to the public address. Only paired clients get past the handshake.
+
+Direct connections through NAT without either (via `iroh`) are planned for M6.
 
 ### H.264 or MJPEG
 

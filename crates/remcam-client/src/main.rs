@@ -7,6 +7,9 @@
 //! Camera controls can be set at startup (`--ctrl`) or typed while streaming.
 //! If the connection drops after streaming has started, the client keeps the
 //! loopback device open and reconnects.
+//!
+//! The client has its own certificate, and the server must know it (pair
+//! with `--pair`). Servers it trusts are kept in `known_servers`.
 
 mod controls;
 mod discover;
@@ -21,7 +24,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use clap::{Parser, ValueEnum};
+use remcam_proto::pairing::{self, Pake, Role};
 use remcam_proto::tls::{self, ServerTrust};
+use remcam_proto::trust::{self, Entry, KnownServers};
 use remcam_proto::{
     ClientMsg, Codec, ControlInfo, ControlState, DeviceInfo, FourCC, FrameHeader, MAX_FRAME_LEN,
     PROTOCOL_VERSION, SERVER_NAME, ServerMsg, StreamOptions, VideoFormat, read_msg, write_msg,
@@ -81,13 +86,30 @@ struct Args {
     #[arg(long = "ctrl", value_name = "NAME=VALUE")]
     ctrls: Vec<String>,
 
-    /// Expected SHA-256 fingerprint of the server certificate (printed by the server).
+    /// Pair with the server using the code shown by `remcam-server pair`,
+    /// then exit. Afterwards both sides know each other.
+    #[arg(long, value_name = "CODE", conflicts_with_all = ["fingerprint", "insecure", "list"])]
+    pair: Option<String>,
+
+    /// Expected SHA-256 fingerprint of the server certificate (printed by
+    /// the server at startup). Only needed for a server not yet in
+    /// known_servers; it is saved there once the connection works.
     #[arg(long)]
     fingerprint: Option<String>,
 
-    /// Skip server authentication. The connection is still encrypted.
+    /// Skip server authentication. The connection is still encrypted, and
+    /// the server still has to know this client.
     #[arg(long, conflicts_with = "fingerprint")]
     insecure: bool,
+
+    /// Name this client gives the server. Defaults to the hostname.
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Directory holding the client certificate (in client/) and
+    /// known_servers. Defaults to $XDG_CONFIG_HOME/remcam or ~/.config/remcam.
+    #[arg(long)]
+    config_dir: Option<PathBuf>,
 
     /// Feed frames to this v4l2loopback device (e.g. /dev/video10).
     #[arg(long, value_name = "DEVICE")]
@@ -131,22 +153,60 @@ fn parse_size(s: &str) -> Result<(u32, u32), String> {
 
 /// Where to connect, and what mDNS claimed about it (if it came from there).
 struct Target {
+    /// What the server is called in known_servers: the host as given, or
+    /// its mDNS name.
+    name: String,
     addr: SocketAddr,
     advertised_fingerprint: Option<String>,
 }
 
+/// Why we accept the server's certificate.
+enum TrustSource {
+    /// `--fingerprint`; saved to known_servers once the connection works.
+    Flag,
+    /// The known_servers entry for this name.
+    Known(Entry),
+    /// Not known under this name, but under another (e.g. by address
+    /// instead of hostname); the new name is saved once connected.
+    AnyKnown,
+    /// `--insecure`.
+    Insecure,
+}
+
+struct Trust {
+    tls: ServerTrust,
+    source: TrustSource,
+}
+
 /// State that outlives a single connection.
-#[derive(Default)]
 struct State {
     sink: Option<sink::Sink>,
     received: u64,
     /// Whether any session got as far as streaming. Until then, errors are
     /// treated as configuration mistakes and end the program.
     streamed: bool,
+    known: KnownServers,
+    client_name: String,
 }
 
 enum End {
     Quit,
+}
+
+/// An error that reconnecting won't fix, such as a rejected certificate.
+#[derive(Debug)]
+struct Fatal(String);
+
+impl std::fmt::Display for Fatal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Fatal {}
+
+fn is_fatal(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<Fatal>())
 }
 
 #[tokio::main]
@@ -157,6 +217,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    let config_dir = match &args.config_dir {
+        Some(d) => d.clone(),
+        None => trust::default_config_dir()?,
+    };
+    let known = KnownServers::load(&config_dir)?;
 
     if args.discover {
         let servers = discover::browse(DISCOVERY_TIME).await?;
@@ -167,28 +232,19 @@ async fn main() -> anyhow::Result<()> {
             let addrs: Vec<_> = s.addrs.iter().map(|a| a.to_string()).collect();
             println!("{}  port {}  [{}]", s.name, s.port, addrs.join(", "));
             println!(
-                "    fingerprint {}",
-                s.fingerprint.as_deref().unwrap_or("?")
+                "    fingerprint {}  ({})",
+                s.fingerprint.as_deref().unwrap_or("?"),
+                trust_status(&known, &s)
             );
         }
         return Ok(());
     }
 
     let target = find_server(args.server.as_deref()).await?;
-    let trust = match (&args.fingerprint, args.insecure) {
-        (Some(fp), _) => ServerTrust::Fingerprint(fp.clone()),
-        (None, true) => {
-            warn!("--insecure: server identity is NOT verified");
-            ServerTrust::Insecure
-        }
-        (None, false) => match &target.advertised_fingerprint {
-            Some(fp) => bail!(
-                "pass --fingerprint to authenticate the server. It advertises\n  {fp}\n\
-                 Check that this matches the fingerprint the server prints at startup."
-            ),
-            None => bail!("pass --fingerprint (printed by the server at startup), or --insecure"),
-        },
-    };
+    // Separate from the server's identity, so both can run as one user.
+    let identity = tls::load_or_create_identity(&config_dir.join("client"))?;
+    let client_fp = identity.fingerprint();
+    let client_name = args.name.clone().unwrap_or_else(hostname);
 
     let bind: SocketAddr = if target.addr.is_ipv4() {
         "0.0.0.0:0"
@@ -197,7 +253,26 @@ async fn main() -> anyhow::Result<()> {
     }
     .parse()?;
     let mut endpoint = quinn::Endpoint::client(bind)?;
-    endpoint.set_default_client_config(tls::client_config(trust)?);
+
+    if let Some(code) = &args.pair {
+        let code = pairing::normalize_code(code)?;
+        endpoint.set_default_client_config(tls::client_config(ServerTrust::Any, identity)?);
+        let mut known = known;
+        let result = pair(
+            &endpoint,
+            &target,
+            &code,
+            &client_name,
+            &client_fp,
+            &mut known,
+        )
+        .await;
+        endpoint.wait_idle().await;
+        return result;
+    }
+
+    let trust = server_trust(&args, &target, &known)?;
+    endpoint.set_default_client_config(tls::client_config(trust.tls.clone(), identity)?);
 
     // Ctrl-C or SIGTERM (e.g. from systemd or `timeout`) end the stream
     // cleanly, so the server releases the camera right away instead of
@@ -213,13 +288,20 @@ async fn main() -> anyhow::Result<()> {
     });
     let mut commands = spawn_command_reader();
 
-    let mut state = State::default();
+    let mut state = State {
+        sink: None,
+        received: 0,
+        streamed: false,
+        known,
+        client_name,
+    };
     let mut backoff = Duration::from_secs(1);
     let result = loop {
         let started = Instant::now();
         let outcome = session(
             &endpoint,
             &target,
+            &trust,
             &args,
             &mut state,
             &mut quit_rx,
@@ -228,7 +310,7 @@ async fn main() -> anyhow::Result<()> {
         .await;
         match outcome {
             Ok(End::Quit) => break Ok(()),
-            Err(e) if !state.streamed => break Err(e),
+            Err(e) if !state.streamed || is_fatal(&e) => break Err(e),
             Err(e) => {
                 // A session that streamed for a while was healthy; start over.
                 if started.elapsed() > MAX_BACKOFF {
@@ -254,6 +336,7 @@ async fn find_server(server: Option<&str>) -> anyhow::Result<Target> {
     if let Some(name) = server {
         if let Ok(addr) = resolve(name).await {
             return Ok(Target {
+                name: name.to_string(),
                 addr,
                 advertised_fingerprint: None,
             });
@@ -296,9 +379,216 @@ fn target_from(server: discover::Server) -> anyhow::Result<Target> {
         .with_context(|| format!("{} has no usable address", server.name))?;
     info!("found {} at {addr}", server.name);
     Ok(Target {
+        name: server.name,
         addr,
         advertised_fingerprint: server.fingerprint,
     })
+}
+
+/// How a discovered server relates to known_servers, for `--discover`.
+fn trust_status(known: &KnownServers, server: &discover::Server) -> String {
+    let advertised = server.fingerprint.as_deref().unwrap_or_default();
+    match known.lookup(&server.name) {
+        Some(e) if e.fingerprint == advertised => "known".into(),
+        Some(e) => format!(
+            "known, but {}:{} has a different fingerprint",
+            known.path().display(),
+            e.line
+        ),
+        None if known.contains_fingerprint(advertised) => "known under another name".into(),
+        None => "not paired".into(),
+    }
+}
+
+/// Decide which server certificates to accept, before connecting.
+fn server_trust(args: &Args, target: &Target, known: &KnownServers) -> anyhow::Result<Trust> {
+    if args.insecure {
+        warn!("--insecure: server identity is NOT verified");
+        return Ok(Trust {
+            tls: ServerTrust::Any,
+            source: TrustSource::Insecure,
+        });
+    }
+    let entry = known.lookup(&target.name);
+    if let Some(fp) = &args.fingerprint {
+        let fp = tls::parse_fingerprint(fp)?;
+        if let Some(e) = entry.filter(|e| e.fingerprint != fp) {
+            bail!(
+                "{}:{} has a different fingerprint for {}:\n  {}\n\
+                 If the server's identity changed on purpose, pair again (or delete that line).",
+                known.path().display(),
+                e.line,
+                target.name,
+                e.fingerprint
+            );
+        }
+        return Ok(Trust {
+            tls: ServerTrust::Fingerprints(vec![fp]),
+            source: TrustSource::Flag,
+        });
+    }
+    if let Some(e) = entry {
+        return Ok(Trust {
+            tls: ServerTrust::Fingerprints(vec![e.fingerprint.clone()]),
+            source: TrustSource::Known(e.clone()),
+        });
+    }
+    let fingerprints = known.fingerprints();
+    if fingerprints.is_empty() {
+        bail!(Fatal(not_known_message(target)));
+    }
+    Ok(Trust {
+        tls: ServerTrust::Fingerprints(fingerprints),
+        source: TrustSource::AnyKnown,
+    })
+}
+
+fn not_known_message(target: &Target) -> String {
+    let mut msg = format!(
+        "{} isn't a known server. To pair with it, run `remcam-server pair` on the server, then\n    \
+         remcam-client {} --pair CODE\n\
+         or pass --fingerprint (the server prints it at startup).",
+        target.name, target.name
+    );
+    if let Some(fp) = &target.advertised_fingerprint {
+        msg += &format!(
+            "\nIt advertises fingerprint {fp} on the LAN, but that isn't proof: \
+             compare it with the server's own output."
+        );
+    }
+    msg
+}
+
+/// Turn handshake failures into messages that say what to do.
+fn connect_error(e: quinn::ConnectionError, target: &Target, trust: &Trust) -> anyhow::Error {
+    use quinn::{ConnectionError, TransportErrorCode};
+    const NO_APPLICATION_PROTOCOL: u8 = 120;
+    match &e {
+        ConnectionError::ConnectionClosed(c)
+            if c.error_code == TransportErrorCode::crypto(NO_APPLICATION_PROTOCOL) =>
+        {
+            Fatal(format!(
+                "{} doesn't speak remcam protocol v{PROTOCOL_VERSION}; \
+                 run the same remcam version on server and client",
+                target.addr
+            ))
+            .into()
+        }
+        // The server's limits on new connections; retrying later is fine.
+        ConnectionError::ConnectionClosed(c)
+            if c.error_code == TransportErrorCode::CONNECTION_REFUSED =>
+        {
+            anyhow::anyhow!(
+                "{} refused the connection: too many recent attempts from this address, \
+                 or too many clients connecting at once; try again in a minute",
+                target.addr
+            )
+        }
+        // TLS errors raised here: our check of the server's certificate.
+        ConnectionError::TransportError(t) if (0x100..0x200).contains(&u64::from(t.code)) => {
+            let hint = match &trust.source {
+                TrustSource::Known(e) => format!(
+                    "known_servers line {} expects {} for {}.\n\
+                     If the server's identity changed on purpose (reinstalled, config deleted), \
+                     pair again. Otherwise something may be impersonating it.",
+                    e.line, e.fingerprint, target.name
+                ),
+                TrustSource::Flag => "It doesn't match --fingerprint.".into(),
+                TrustSource::AnyKnown => not_known_message(target),
+                TrustSource::Insecure => String::new(),
+            };
+            let reason = t.reason.trim_start_matches("unexpected error: ");
+            Fatal(format!("{}: {reason}\n{hint}", target.addr)).into()
+        }
+        _ => anyhow::Error::new(e).context(format!("connecting to {}", target.addr)),
+    }
+}
+
+async fn connect(
+    endpoint: &quinn::Endpoint,
+    target: &Target,
+    trust: Option<&Trust>,
+) -> anyhow::Result<quinn::Connection> {
+    let connecting = endpoint.connect(target.addr, SERVER_NAME)?;
+    match tokio::time::timeout(CONNECT_TIMEOUT, connecting).await {
+        Err(_) => bail!("timed out connecting to {}", target.addr),
+        Ok(Ok(conn)) => Ok(conn),
+        Ok(Err(e)) => match trust {
+            Some(trust) => Err(connect_error(e, target, trust)),
+            None => Err(anyhow::Error::new(e).context(format!("connecting to {}", target.addr))),
+        },
+    }
+}
+
+/// Pair with the server: prove we both know the code on this connection,
+/// then remember its certificate. The server remembers ours.
+async fn pair(
+    endpoint: &quinn::Endpoint,
+    target: &Target,
+    code: &str,
+    client_name: &str,
+    client_fp: &str,
+    known: &mut KnownServers,
+) -> anyhow::Result<()> {
+    let conn = connect(endpoint, target, None).await?;
+    let server_fp = tls::peer_fingerprint(&conn).context("server presented no certificate")?;
+    let result = async {
+        let (mut ctl_tx, mut ctl_rx) = conn.open_bi().await?;
+        let (pake, spake) = Pake::start(Role::Client, code);
+        write_msg(
+            &mut ctl_tx,
+            &ClientMsg::Pair {
+                version: PROTOCOL_VERSION,
+                client_name: client_name.to_string(),
+                spake,
+            },
+        )
+        .await?;
+        let (server_name, server_spake) = match read_msg(&mut ctl_rx).await? {
+            ServerMsg::Pair { server_name, spake } => (server_name, spake),
+            ServerMsg::Error { msg } => bail!("the server refused: {msg}"),
+            other => bail!("expected Pair, got {other:?}"),
+        };
+        let binding = pairing::binding(&conn, client_fp, &server_fp)?;
+        let confirmation = pake.finish(&server_spake, binding)?;
+        write_msg(
+            &mut ctl_tx,
+            &ClientMsg::PairConfirm {
+                mac: confirmation.mac(),
+            },
+        )
+        .await?;
+        match read_msg(&mut ctl_rx).await? {
+            ServerMsg::PairConfirm { mac } if confirmation.verify(&mac) => {}
+            ServerMsg::PairConfirm { .. } => bail!(
+                "the server's confirmation doesn't match, so something may be \
+                 intercepting the connection. Nothing was saved."
+            ),
+            ServerMsg::Error { msg } => bail!("pairing failed: {msg}"),
+            other => bail!("expected PairConfirm, got {other:?}"),
+        }
+        if let Some(old) = known
+            .lookup(&target.name)
+            .filter(|e| e.fingerprint != server_fp)
+        {
+            warn!(
+                "replacing the old fingerprint for {} ({})",
+                target.name, old.fingerprint
+            );
+        }
+        known.replace(&target.name, &server_fp)?;
+        println!("Paired with {server_name} as {client_name}.");
+        println!("    server fingerprint {server_fp}");
+        println!(
+            "Saved to {}. From now on, connect with:",
+            known.path().display()
+        );
+        println!("    remcam-client {} [options]", target.name);
+        anyhow::Ok(())
+    }
+    .await;
+    conn.close(0u32.into(), b"bye");
+    result
 }
 
 /// Read interactive commands from stdin, if it's a terminal.
@@ -327,23 +617,30 @@ fn spawn_command_reader() -> mpsc::Receiver<String> {
 async fn session(
     endpoint: &quinn::Endpoint,
     target: &Target,
+    trust: &Trust,
     args: &Args,
     state: &mut State,
     quit: &mut watch::Receiver<bool>,
     commands: &mut mpsc::Receiver<String>,
 ) -> anyhow::Result<End> {
-    let connecting = endpoint.connect(target.addr, SERVER_NAME)?;
-    let conn = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
-        .await
-        .with_context(|| format!("timed out connecting to {}", target.addr))?
-        .with_context(|| format!("connecting to {}", target.addr))?;
-    let result = stream(&conn, args, state, quit, commands).await;
+    let conn = connect(endpoint, target, Some(trust)).await?;
+    // A server accepted by --fingerprint or under another name: remember
+    // it under this name too, so next time no flag is needed.
+    if matches!(trust.source, TrustSource::Flag | TrustSource::AnyKnown)
+        && state.known.lookup(&target.name).is_none()
+        && let Some(fp) = tls::peer_fingerprint(&conn)
+    {
+        state.known.add(&target.name, &fp)?;
+        info!("saved {} to {}", target.name, state.known.path().display());
+    }
+    let result = stream(&conn, target, args, state, quit, commands).await;
     conn.close(0u32.into(), b"bye");
     result
 }
 
 async fn stream(
     conn: &quinn::Connection,
+    target: &Target,
     args: &Args,
     state: &mut State,
     quit: &mut watch::Receiver<bool>,
@@ -354,7 +651,7 @@ async fn stream(
         &mut ctl_tx,
         &ClientMsg::Hello {
             version: PROTOCOL_VERSION,
-            client_name: client_name(),
+            client_name: state.client_name.clone(),
         },
     )
     .await?;
@@ -369,6 +666,13 @@ async fn stream(
             codecs
         }
         ServerMsg::Hello { version, .. } => bail!("server speaks protocol version {version}"),
+        ServerMsg::Unauthorized { fingerprint } => bail!(Fatal(format!(
+            "{} doesn't know this client (fingerprint {fingerprint}).\n\
+             To pair, run `remcam-server pair` on the server, then\n    \
+             remcam-client {} --pair CODE\n\
+             or add the fingerprint to the server's authorized_clients.",
+            target.name, target.name
+        ))),
         ServerMsg::Error { msg } => bail!("server error: {msg}"),
         other => bail!("expected Hello, got {other:?}"),
     };
@@ -856,7 +1160,7 @@ async fn resolve(server: &str) -> anyhow::Result<SocketAddr> {
         .with_context(|| format!("no address for {with_port}"))
 }
 
-fn client_name() -> String {
+fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "remcam-client".into())
