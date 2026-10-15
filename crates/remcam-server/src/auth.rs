@@ -11,6 +11,7 @@
 //! ← code K7QM-4XRT 300          (seconds valid)
 //! ← wrong 2                     (a client tried a wrong code; attempts left)
 //! ← paired <fingerprint> laptop
+//! ← failed <reason>             (the right code, but saving the client failed)
 //! ← cancelled                   (too many wrong attempts)
 //! ← replaced                    (a newer `pair` took over)
 //! ```
@@ -148,13 +149,17 @@ impl Auth {
 }
 
 impl Attempt<'_> {
-    fn succeeded(mut self, name: &str, fingerprint: &str) {
+    /// Use up the code (single use) for a client that proved it knows it,
+    /// returning where to report the outcome. `None` if the code was
+    /// cancelled, expired or replaced meanwhile: then the client must not be
+    /// authorized.
+    fn claim(mut self) -> Option<mpsc::UnboundedSender<String>> {
         self.done = true;
         let mut pending = self.auth.pending.lock().unwrap();
         if pending.as_ref().is_some_and(|p| p.id == self.id) {
-            // Single use.
-            let p = pending.take().unwrap();
-            let _ = p.events.send(format!("paired {fingerprint} {name}"));
+            pending.take().map(|p| p.events)
+        } else {
+            None
         }
     }
 }
@@ -221,15 +226,28 @@ pub async fn pair(
         bail!("{client_name} ({client_fp}) tried a wrong pairing code");
     }
 
-    auth.clients
-        .add(client_fp, client_name)
-        .context("saving the new client")?;
+    let Some(events) = attempt.claim() else {
+        let msg = "the pairing code was cancelled or expired meanwhile; run \
+                   `remcam-server pair` again"
+            .to_string();
+        send_final(ctl_tx, &ServerMsg::Error { msg }).await;
+        bail!("{client_name} ({client_fp}) used a pairing code that had just ended");
+    };
+    if let Err(e) = auth.clients.add(client_fp, client_name) {
+        let reason = format!("{e:#}").replace('\n', " ");
+        let _ = events.send(format!("failed {reason}"));
+        let msg = "the server couldn't save the pairing".to_string();
+        send_final(ctl_tx, &ServerMsg::Error { msg }).await;
+        return Err(e.context("saving the new client"));
+    }
     // A client paired before keeps the name it was first saved under.
     let name = auth
         .clients
-        .lookup(client_fp)?
+        .lookup(client_fp)
+        .ok()
+        .flatten()
         .unwrap_or_else(|| client_name.to_string());
-    attempt.succeeded(&name, client_fp);
+    let _ = events.send(format!("paired {client_fp} {name}"));
     info!(
         "paired with {name} ({client_fp}); it is in {}",
         auth.clients.path().display()
@@ -367,6 +385,10 @@ pub async fn run_pair_command(config_dir: &Path, server_name: &str) -> anyhow::R
                 println!("Paired with {name}");
                 println!("    fingerprint {fp}");
                 return Ok(());
+            }
+            Some("failed") => {
+                let reason = line.strip_prefix("failed").unwrap_or_default().trim();
+                bail!("a client used the code, but the server couldn't save it: {reason}")
             }
             Some("expired") => bail!("the code expired; run `remcam-server pair` again"),
             Some("cancelled") => bail!("too many wrong attempts; the code was cancelled"),

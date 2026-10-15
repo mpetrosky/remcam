@@ -82,7 +82,9 @@ Without pairing:
 - **Server identity:** pass `--fingerprint <hex>` once; it's saved in
   `known_servers` when the connection works. A server already known under
   one name (say its address) is accepted under another (its hostname or mDNS
-  name) and saved under that name too.
+  name) and saved under that name too, as long as it's clear which server
+  that is: the only one in `known_servers`, or the one whose fingerprint it
+  advertises over mDNS.
 - **Client identity:** a client the server doesn't know is turned away
   before it can list or open a camera, with an error showing its
   fingerprint. Adding that fingerprint to the server's `authorized_clients`

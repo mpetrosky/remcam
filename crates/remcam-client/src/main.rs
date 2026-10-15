@@ -167,7 +167,8 @@ enum TrustSource {
     /// The known_servers entry for this name.
     Known(Entry),
     /// Not known under this name, but under another (e.g. by address
-    /// instead of hostname); the new name is saved once connected.
+    /// instead of hostname), and it's clear which server that is; the new
+    /// name is saved once connected.
     AnyKnown,
     /// `--insecure`.
     Insecure,
@@ -433,12 +434,27 @@ fn server_trust(args: &Args, target: &Target, known: &KnownServers) -> anyhow::R
             source: TrustSource::Known(e.clone()),
         });
     }
+    // Not known under this name. Accept a server known under another name
+    // only when it's clear which one is meant, since the new name gets saved
+    // for it: the one it advertises over mDNS (TLS still has to prove it), or
+    // the only known server. Accepting any known server would let whichever
+    // answers at this address claim the name.
     let fingerprints = known.fingerprints();
-    if fingerprints.is_empty() {
-        bail!(Fatal(not_known_message(target)));
-    }
+    let fingerprint = match &target.advertised_fingerprint {
+        Some(fp) if known.contains_fingerprint(fp) => fp.clone(),
+        _ => match fingerprints.as_slice() {
+            [] => bail!(Fatal(not_known_message(target))),
+            [fp] => fp.clone(),
+            _ => bail!(Fatal(format!(
+                "{} isn't in {}, and several servers are, so it's unclear which one this is.\n\
+                 Connect using the name it's saved under, pass --fingerprint, or pair with it.",
+                target.name,
+                known.path().display()
+            ))),
+        },
+    };
     Ok(Trust {
-        tls: ServerTrust::Fingerprints(fingerprints),
+        tls: ServerTrust::Fingerprints(vec![fingerprint]),
         source: TrustSource::AnyKnown,
     })
 }

@@ -177,11 +177,14 @@ Client names come from the client, so the server reduces them to
   `--fingerprint`, or the entry for that host in `known_servers`. A server
   whose fingerprint changed is a hard error naming the file and line, like
   SSH. `--fingerprint` with a host not yet in `known_servers` adds it, so
-  the fingerprint is needed only once. A name not in `known_servers`
-  accepts any fingerprint that is in it under another name (the same
-  server reached by address, hostname or mDNS name) and is then saved as an
-  alias; with no known servers at all, the client refuses before
-  connecting. mDNS-advertised fingerprints are only shown, never trusted.
+  the fingerprint is needed only once. A name not in `known_servers` (the
+  same server reached by address, hostname or mDNS name) is accepted only
+  when it's clear which known server it is: the one whose fingerprint it
+  advertises over mDNS, or the only one in the file. It is then saved as an
+  alias. With several known servers and no such hint, or none at all, the
+  client refuses before connecting. An mDNS-advertised fingerprint is never
+  trusted by itself; it only picks among servers already in the file, and
+  TLS still has to prove it.
 - Rejections the client can't fix by retrying (unknown client, changed
   server certificate, protocol mismatch) end the client even after it has
   streamed, instead of reconnecting forever.
