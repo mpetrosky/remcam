@@ -22,11 +22,14 @@ use tracing::{debug, info, warn};
 
 use crate::auth::Auth;
 use crate::camera::Controls;
-use crate::limits::Limits;
+use crate::limits::{Limits, Refused};
 use crate::pipeline::Pipeline;
 
 /// How long a new connection may take to say Hello (or Pair).
 const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(10);
+/// Minimum gap between warnings that the address table is full, so a sustained
+/// flood doesn't flood the log too.
+const TABLE_FULL_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
 #[command(about = "Share local webcams over the network")]
@@ -136,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let limits = Limits::new();
+    let mut last_full_warn: Option<Instant> = None;
     while let Some(incoming) = endpoint.accept().await {
         let remote = incoming.remote_address();
         // Make the client prove it owns its source address before it counts
@@ -146,10 +150,27 @@ async fn main() -> anyhow::Result<()> {
             }
             continue;
         }
-        let Some(permit) = limits.admit(remote.ip(), Instant::now()) else {
-            debug!("{remote}: too many connections, refusing");
-            incoming.refuse();
-            continue;
+        let now = Instant::now();
+        let permit = match limits.admit(remote.ip(), now) {
+            Ok(permit) => permit,
+            Err(Refused::TableFull) => {
+                if last_full_warn.is_none_or(|t| now.duration_since(t) >= TABLE_FULL_WARN_INTERVAL)
+                {
+                    warn!(
+                        "too many client addresses connecting; refusing new ones ({remote} and others)"
+                    );
+                    last_full_warn = Some(now);
+                } else {
+                    debug!("{remote}: address table full, refusing");
+                }
+                incoming.refuse();
+                continue;
+            }
+            Err(reason) => {
+                debug!("{remote}: too many connections ({reason:?}), refusing");
+                incoming.refuse();
+                continue;
+            }
         };
         let auth = auth.clone();
         tokio::spawn(async move {
