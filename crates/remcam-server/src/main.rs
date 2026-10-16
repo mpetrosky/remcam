@@ -138,6 +138,14 @@ async fn main() -> anyhow::Result<()> {
     let limits = Limits::new();
     while let Some(incoming) = endpoint.accept().await {
         let remote = incoming.remote_address();
+        // Make the client prove it owns its source address before it counts
+        // against any limit; otherwise spoofed packets can fill the table.
+        if !incoming.remote_address_validated() {
+            if let Err(e) = incoming.retry() {
+                e.into_incoming().ignore();
+            }
+            continue;
+        }
         let Some(permit) = limits.admit(remote.ip(), Instant::now()) else {
             debug!("{remote}: too many connections, refusing");
             incoming.refuse();
