@@ -2,6 +2,7 @@
 //! and pairing attempts can't be used to tie up the server.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -48,6 +49,15 @@ struct Recent {
     last_sweep: Instant,
 }
 
+impl Recent {
+    /// Drop windows that have expired.
+    fn sweep(&mut self, now: Instant) {
+        self.windows
+            .retain(|_, (start, _)| now.duration_since(*start) < WINDOW);
+        self.last_sweep = now;
+    }
+}
+
 impl Limits {
     pub fn new() -> Self {
         Self {
@@ -63,19 +73,28 @@ impl Limits {
     /// is authorized (or rejected).
     pub fn admit(&self, ip: IpAddr, now: Instant) -> Result<OwnedSemaphorePermit, Refused> {
         {
-            let mut recent = self.recent.lock().unwrap();
-            let since_sweep = now.duration_since(recent.last_sweep);
-            let full = |r: &Recent| r.windows.len() >= MAX_TRACKED && !r.windows.contains_key(&ip);
-            if since_sweep >= WINDOW || (since_sweep >= FULL_SWEEP_INTERVAL && full(&recent)) {
-                recent
-                    .windows
-                    .retain(|_, (start, _)| now.duration_since(*start) < WINDOW);
-                recent.last_sweep = now;
+            let mut guard = self.recent.lock().unwrap();
+            let recent = &mut *guard;
+            if now.duration_since(recent.last_sweep) >= WINDOW {
+                recent.sweep(now);
             }
-            if full(&recent) {
-                return Err(Refused::TableFull);
-            }
-            let (start, count) = recent.windows.entry(ip).or_insert((now, 0));
+            let full = recent.windows.len() >= MAX_TRACKED;
+            // One lookup for a known address, or a new one when there's room.
+            let (start, count) = match recent.windows.entry(ip) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) if !full => e.insert((now, 0)),
+                // Full and unknown: sweep early, if not done too recently.
+                Entry::Vacant(_) => {
+                    if now.duration_since(recent.last_sweep) < FULL_SWEEP_INTERVAL {
+                        return Err(Refused::TableFull);
+                    }
+                    recent.sweep(now);
+                    if recent.windows.len() >= MAX_TRACKED {
+                        return Err(Refused::TableFull);
+                    }
+                    recent.windows.entry(ip).or_insert((now, 0))
+                }
+            };
             if now.duration_since(*start) >= WINDOW {
                 *start = now;
                 *count = 0;
