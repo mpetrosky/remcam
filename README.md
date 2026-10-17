@@ -225,3 +225,24 @@ ffmpeg -f v4l2 -input_format mjpeg -video_size 1280x720 -i /dev/video0 \
     -frames:v 90 -c copy frames/%03d.jpg
 cargo run --release -p remcam-codec --example h264_bench -- frames [KBPS] [FPS]
 ```
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Unless you explicitly state otherwise, any contribution
+intentionally submitted for inclusion in this work shall be dual licensed as
+above, without any additional terms or conditions.
+
+### H.264 patents
+
+The H.264 path uses [OpenH264](https://github.com/cisco/openh264), which is
+built from bundled source and is itself BSD-2-Clause licensed. That license
+does not cover H.264's patents. Cisco's patent coverage applies only to the
+binaries it builds and distributes, not to a build from source. If you
+distribute remcam binaries that include H.264 support, you may need a patent
+license (for example from Via LA, formerly MPEG LA). The MJPEG path does not
+involve H.264.
