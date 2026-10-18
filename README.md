@@ -3,6 +3,10 @@
 Share a USB webcam over the network. See [DESIGN.md](DESIGN.md) for the
 protocol and roadmap.
 
+> **Status:** a personal project. It has only been tested on Linux, and it
+> has not been security-audited. Treat the authentication as a good-faith
+> design, not a guarantee, and prefer a VPN over exposing the port directly.
+
 Current state: **M5**. The server captures MJPEG from a V4L2 camera and sends
 it over QUIC, either as is or re-encoded to H.264 at a bitrate that adapts to
 the link. The client decodes it into a v4l2loopback device, where any app
@@ -103,10 +107,11 @@ addresses have connected within the last minute, new addresses are refused.
 
 ### Across the internet
 
-remcam's own authentication makes it safe to expose, so there are two easy
-options today:
+remcam authenticates every client, which is meant to make exposing it
+reasonable, but it hasn't been audited, so a VPN is the safer choice. Two
+easy options today:
 
-- **Tailscale or WireGuard** on both machines: connect to the server's VPN
+- **Tailscale or WireGuard** on both machines (recommended): connect to the server's VPN
   address. Nothing to open on the router. This works well with remcam's
   UDP traffic; tunnelling through SSH or a TLS proxy doesn't, since those
   carry TCP and bring back the stalls and hidden congestion that QUIC avoids.

@@ -232,8 +232,9 @@ addresses are refused until the once-a-minute sweep frees room.
 In order of effort:
 
 1. **Tailscale or WireGuard:** works now; remcam sees an ordinary address.
-2. **A forwarded UDP port** on the camera host's router: safe once client
-   authentication is in place, since only paired clients get past `Hello`.
+2. **A forwarded UDP port** on the camera host's router: reasonable once
+   client authentication is in place, since only paired clients get past
+   `Hello`, but unaudited, so a VPN is safer.
 3. **`iroh` (M6):** hole punching with a relay fallback, no router setup.
    Its relays only see encrypted QUIC. iroh identifies peers by Ed25519
    keys, which would replace the certificate fingerprints, so the trust
