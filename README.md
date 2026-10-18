@@ -1,5 +1,8 @@
 # remcam
 
+[![GitLab pipeline](https://gitlab.com/mpetrosky/remcam/badges/master/pipeline.svg)](https://gitlab.com/mpetrosky/remcam/-/pipelines)
+[![GitHub CI](https://github.com/mpetrosky/remcam/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/mpetrosky/remcam/actions/workflows/ci.yml)
+
 Share a USB webcam over the network. See [DESIGN.md](DESIGN.md) for the
 protocol and roadmap.
 
