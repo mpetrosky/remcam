@@ -1,0 +1,25 @@
+# Keep the toolchain tag in step with rust-toolchain.toml.
+image: rust:1.99-slim-bookworm
+
+variables:
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  CARGO_TERM_COLOR: always
+
+cache:
+  key: $CI_COMMIT_REF_SLUG
+  paths:
+    - .cargo/registry/
+    - target/
+
+check:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends build-essential cmake nasm pkg-config libclang-dev libjpeg-dev libturbojpeg0-dev
+    # Version and components come from rust-toolchain.toml.
+    - rustup show active-toolchain || rustup toolchain install
+  script:
+    - cargo fmt --all --check
+    - cargo clippy --workspace --all-targets -- -D warnings
+    - cargo test --workspace
